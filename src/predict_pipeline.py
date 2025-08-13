@@ -12,7 +12,6 @@ from sklearn.preprocessing import MinMaxScaler
 # Models
 from lightgbm import LGBMRegressor
 from xgboost import XGBRegressor
-from prophet import Prophet
 
 # Local helpers (assumes these modules exist in src/)
 from src.data_fetch import fetch_prices, bs_price, fetch_option_chain, enrich_chain_with_iv
@@ -20,11 +19,11 @@ from src.news_sentiment import get_sentiment_score
 from src.models import LSTMModel, lstm_train_predict, gbm_simulation, black_scholes_paths, quantum_predict_distribution
 
 try:
-    from prophet import Prophet  # type: ignore
-    _HAS_PROPHET = True
+  Prophet = None  # type: ignore
+  _HAS_PROPHET = False
 except Exception:
-    Prophet = None  # type: ignore
-    _HAS_PROPHET = False
+  Prophet = None  # type: ignore
+  _HAS_PROPHET = False
 
 MODEL_DIR = os.path.join(os.getcwd(), "models")
 os.makedirs(MODEL_DIR, exist_ok=True)
