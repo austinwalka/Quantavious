@@ -1,10 +1,11 @@
 # src/news_sentiment.py
 import requests
 import numpy as np
+import os
 
 # You can sign up for free API keys on NewsAPI.org or similar services.
 # Here is a placeholder using NewsAPI.org (replace YOUR_API_KEY)
-NEWS_API_KEY = "7edaec35d5be4ee8846cbec2eed677d1"
+NEWS_API_KEY = os.getenv("NEWS_API_KEY", "YOUR_NEWSAPI_KEY")
 
 def get_sentiment_score(ticker):
     """
