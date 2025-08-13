@@ -1,130 +1,112 @@
+# app.py
+import os
 import streamlit as st
 import pandas as pd
-import plotly.graph_objects as go
-from src.predict_pipeline import predict_stock
+import numpy as np
+from io import StringIO
+from datetime import datetime
 
-import os
+from src.predict_pipeline import predict_stock, load_finbert_pipeline_cached
 
-print("DEBUG: Render PORT =", os.getenv("PORT"))
-print("DEBUG: NEWS_API_KEY =", "SET" if os.getenv("NEWS_API_KEY") else "MISSING")
-
-
-# ---------------------------
-# Streamlit Page Config
-# ---------------------------
-st.set_page_config(
-    layout="wide",
-    page_title="Quantavius by Walker Wealth",
-    page_icon="📊"
-)
-
-if "tickers" not in st.session_state:
-    st.session_state.tickers = []
-
-# ---------------------------
-# Title & Description
-# ---------------------------
-st.title("📊 Quantavius by Walker Wealth")
+st.set_page_config(page_title="Quantavius — Short-Term (Meta Blend + LSTM + Schrodinger)", layout="wide")
+st.title("Quantavius — Short-Term Forecasting (LSTM + Schrodinger + Meta-Blend)")
 
 st.markdown("""
-**Quantavius** is an AI-powered market forecasting tool that combines **multiple predictive models** into one ensemble.  
-Models included:
-- **LightGBM** & **XGBoost** – tree-based gradient boosting  
-- **Prophet** – trend + seasonality decomposition  
-- **LSTM** – deep learning recurrent network for time-series  
-- **Black–Scholes** – options theory-based price estimation  
-- **FinBERT Sentiment** – adjusts forecasts based on news tone  
-- *(Optional)* Quantum optimizer for model weight tuning  
-
-You can:
-1. Create a list of symbols  
-2. Choose your forecast horizon  
-3. Run all models  
-4. Compare results in tables & charts  
-5. Download forecasts for offline analysis
----
+**What this app does**
+- Runs short-term forecasts (intraday 1m/5m/15m or daily) using:
+  - GBM Monte Carlo (mean path)
+  - Ornstein-Uhlenbeck (Langevin) mean-reverting model
+  - LSTM (PyTorch) trained on recent price history
+  - Schrödinger quantum evolution (PDF terminal proxy)
+- Blends model outputs into a **Best_Guess** using RMSE-based weights and a **finBERT** sentiment tilt.
+- Batch mode: run multiple tickers at once and download CSV of combined forecasts.
 """)
 
-# ---------------------------
-# Sidebar - Symbol Controls
-# ---------------------------
-st.sidebar.header("📌 Symbol List")
+with st.sidebar:
+    st.header("Run settings")
+    tickers_text = st.text_area("Tickers (comma-separated)", value="AAPL, MSFT, NVDA")
+    mode = st.selectbox("Mode", ["intraday", "daily"], help="intraday uses 1m/5m intervals; daily uses business days")
+    interval = st.selectbox("Interval (intraday)", ["1m", "5m", "15m"], index=0)
+    lookback_days = st.slider("Lookback days", min_value=1, max_value=14, value=5)
+    forecast_steps = st.slider("Forecast steps (bars/periods)", min_value=10, max_value=240, value=60)
+    n_paths = st.slider("Simulation paths (GBM/OU)", min_value=100, max_value=2000, value=800, step=100)
+    use_finbert = st.checkbox("Load finBERT (may be heavy)", value=False)
+    news_key = os.getenv("NEWS_API_KEY", None)
+    st.caption("NEWS_API_KEY loaded: " + ("✅" if news_key else "⚠️ Missing; sentiment will be heuristic"))
 
-ticker_input = st.sidebar.text_input("Add Symbol", "")
-if st.sidebar.button("Add Symbol"):
-    if ticker_input and ticker_input.upper() not in st.session_state.tickers:
-        st.session_state.tickers.append(ticker_input.upper())
+col_left, col_right = st.columns([3, 1])
 
-if st.session_state.tickers:
-    st.sidebar.write("### Current Symbols")
-    for t in st.session_state.tickers:
-        if st.sidebar.button(f"❌ Remove {t}"):
-            st.session_state.tickers.remove(t)
+# optionally pre-load finbert pipeline
+preload_btn = st.button("Pre-load finBERT model (cached)")
+if use_finbert and preload_btn:
+    with st.spinner("Loading finBERT (this may take a while)..."):
+        pipe = load_finbert_pipeline_cached()
+        if pipe is None:
+            st.warning("finBERT not available or failed to load; falling back to heuristic.")
+        else:
+            st.success("finBERT pipeline loaded (cached).")
 
-forecast_days = st.sidebar.slider("Forecast Horizon (days)", 5, 60, 14)
-run_button = st.sidebar.button("🚀 Run Forecasts")
+run_btn = st.button("Run batch forecasts")
 
-# ---------------------------
-# Main Processing
-# ---------------------------
-if run_button and st.session_state.tickers:
-    all_results = []
+def parse_tickers(text):
+    return [t.strip().upper() for t in text.split(",") if t.strip()]
 
-    for ticker in st.session_state.tickers:
-        st.subheader(f"📈 Forecast Results: {ticker}")
+if run_btn:
+    tickers = parse_tickers(tickers_text)
+    if not tickers:
+        st.warning("Please enter at least one ticker.")
+    else:
+        combined = []
+        summary_rows = []
+        for t in tickers:
+            with st.spinner(f"Running {t}..."):
+                try:
+                    forecast_df, rmse_dict, weights = predict_stock(
+                        ticker=t,
+                        start_date=str(datetime.now().date()),   # not used much, fetch uses lookback
+                        end_date=str(datetime.now().date()),
+                        mode=mode,
+                        interval=interval,
+                        lookback_days=lookback_days,
+                        forecast_steps=forecast_steps,
+                        n_paths=n_paths,
+                        news_api_key=news_key,
+                        tilt_strength=0.5,
+                        lstm_lookback=60,
+                        lstm_epochs=20
+                    )
+                    forecast_df = forecast_df.reset_index().rename(columns={"index":"Step"})
+                    forecast_df["Ticker"] = t
+                    combined.append(forecast_df)
+                    summary_rows.append({
+                        "Ticker": t,
+                        "RMSE_GBM": rmse_dict.get("GBM", np.nan),
+                        "RMSE_OU": rmse_dict.get("OU", np.nan),
+                        "RMSE_ML": rmse_dict.get("ML", np.nan),
+                        "Sentiment": float(forecast_df["Sentiment"].iloc[0]) if "Sentiment" in forecast_df.columns else np.nan
+                    })
+                    # show quick plot for this ticker
+                    with col_left:
+                        st.subheader(f"{t} — Best Guess vs components")
+                        st.line_chart(forecast_df.set_index("Step")[["GBM","OU","ML","Best_Guess"]])
+                    with col_right:
+                        st.metric(label=f"{t} Schrodinger mean", value=f"{forecast_df['Schrodinger_mean'].iloc[0]:.2f}")
+                        st.write("Blend weights")
+                        st.json(weights)
+                except Exception as e:
+                    st.error(f"{t} failed: {e}")
 
-        # Predict
-        result_df, rmse_scores = predict_stock(
-            ticker,
-            start="2023-01-01",
-            end="2024-12-31",
-            forecast_days=forecast_days
-        )
+        if combined:
+            all_df = pd.concat(combined, ignore_index=True)
+            st.subheader("Combined batch forecasts")
+            st.dataframe(all_df)
+            csv = all_df.to_csv(index=False)
+            b = csv.encode("utf-8")
+            st.download_button("Download CSV of combined forecasts", b, file_name="quantavius_forecasts.csv", mime="text/csv")
 
-        # RMSE Table
-        rmse_df = pd.DataFrame(list(rmse_scores.items()), columns=["Model", "RMSE"]).sort_values("RMSE")
-        st.markdown("**Model Performance (Lower RMSE is better)**")
-        st.dataframe(rmse_df, use_container_width=True)
+            summary_df = pd.DataFrame(summary_rows)
+            st.subheader("Summary RMSE & Sentiment")
+            st.dataframe(summary_df.set_index("Ticker"))
 
-        # Forecast Table
-        st.markdown("**Forecast Table**")
-        st.dataframe(result_df, use_container_width=True)
-
-        # Plot Forecasts
-        fig = go.Figure()
-        for col in result_df.columns:
-            if col != "Date":
-                fig.add_trace(go.Scatter(
-                    x=result_df["Date"],
-                    y=result_df[col],
-                    mode='lines',
-                    name=col
-                ))
-        fig.update_layout(
-            title=f"{ticker} Model Forecasts",
-            xaxis_title="Date",
-            yaxis_title="Price",
-            legend_title="Model",
-            template="plotly_white"
-        )
-        st.plotly_chart(fig, use_container_width=True)
-
-        # Store for combined table
-        all_results.append(result_df.assign(Ticker=ticker))
-
-    # Combined Results
-    merged_df = pd.concat(all_results, ignore_index=True)
-    st.subheader("📊 Combined Results for All Symbols")
-    st.dataframe(merged_df, use_container_width=True)
-
-    # Download Button
-    csv = merged_df.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        "💾 Download All Forecasts as CSV",
-        csv,
-        "thorp_forecasts.csv",
-        "text/csv"
-    )
-
-elif run_button:
-    st.warning("Please add at least one symbol before running forecasts.")
+st.markdown("---")
+st.caption("Notes: LSTM is trained on short history and cached per process. finBERT is optional; if unavailable the sentiment uses a heuristic. For production/backtesting use larger history and walk-forward CV.")
