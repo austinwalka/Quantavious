@@ -25,7 +25,7 @@ finbert-embedding==0.1.5
 sympy>=1.12
 scipy>=1.12.0
 quantumrandom>=1.9.0  # optional for quantum-driven RNG
-quandtum>=0.1.0        # placeholder if using quantum-specific packages
+qutip>=4.7.0  # quantum mechanics & Schrödinger solvers     # placeholder if using quantum-specific packages
 numba>=0.59.0
 
 # Backtesting & Performance
