@@ -3,6 +3,12 @@ import pandas as pd
 import plotly.graph_objects as go
 from src.predict_pipeline import predict_stock
 
+import os
+
+print("DEBUG: Render PORT =", os.getenv("PORT"))
+print("DEBUG: NEWS_API_KEY =", "SET" if os.getenv("NEWS_API_KEY") else "MISSING")
+
+
 # ---------------------------
 # Streamlit Page Config
 # ---------------------------

@@ -99,9 +99,9 @@ def _train_xgboost_and_forecast(train, test, horizon):
 def _train_prophet_and_forecast(train, test, horizon):
     # Check if Prophet is available
     if not _HAS_PROPHET or Prophet is None:
-    forecast = np.repeat(train['Close'].iloc[-1], horizon)
-    rmse = float('nan')
-    return forecast, rmse
+        forecast = np.repeat(train['Close'].iloc[-1], horizon)
+        rmse = float('nan')
+        return forecast, rmse
 
     # Prophet requires ds/y
     df_train = train.reset_index()[['Date', 'Close']].rename(columns={'Date': 'ds', 'Close': 'y'})
