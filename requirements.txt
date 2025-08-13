@@ -19,7 +19,7 @@ statsmodels>=0.14.1
 # Sentiment Analysis
 transformers>=4.39.0
 nltk>=3.8.1
-finbert-embedding>=1.0.0  # or custom load of finBERT
+finbert-embedding==0.1.5
 
 # Math / Stochastic / Quantum modeling
 sympy>=1.12
