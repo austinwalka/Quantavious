@@ -21,6 +21,6 @@ matplotlib>=3.7.1
 python-dotenv>=1.0.0
 ta>=0.10.0
 transformers>=4.30.0
-ARIMA 
+arima 
 prophet
 finBERT
