@@ -19,9 +19,15 @@ from src.data_fetch import fetch_prices, bs_price, fetch_option_chain, enrich_ch
 from src.news_sentiment import get_sentiment_score
 from src.models import LSTMModel, lstm_train_predict, gbm_simulation, black_scholes_paths, quantum_predict_distribution
 
+try:
+    from prophet import Prophet  # type: ignore
+    _HAS_PROPHET = True
+except Exception:
+    Prophet = None  # type: ignore
+    _HAS_PROPHET = False
+
 MODEL_DIR = os.path.join(os.getcwd(), "models")
 os.makedirs(MODEL_DIR, exist_ok=True)
-
 
 def _dates_for_horizon(last_date, horizon_days):
     last = pd.to_datetime(last_date)
@@ -91,6 +97,12 @@ def _train_xgboost_and_forecast(train, test, horizon):
 
 
 def _train_prophet_and_forecast(train, test, horizon):
+    # Check if Prophet is available
+    if not _HAS_PROPHET or Prophet is None:
+    forecast = np.repeat(train['Close'].iloc[-1], horizon)
+    rmse = float('nan')
+    return forecast, rmse
+
     # Prophet requires ds/y
     df_train = train.reset_index()[['Date', 'Close']].rename(columns={'Date': 'ds', 'Close': 'y'})
     df_test = test.reset_index()[['Date', 'Close']].rename(columns={'Date': 'ds', 'Close': 'y'})
