@@ -1,26 +1,44 @@
-numpy>=1.26
-pandas>=2.1
-scipy>=1.11
-scikit-learn>=1.4
-statsmodels>=0.14
+# Core
+streamlit>=1.32.0
+pandas>=2.2.0
+numpy>=1.26.0
+scikit-learn>=1.4.0
+matplotlib>=3.8.2
+yfinance>=0.2.36
+requests>=2.31.0
 
+# ML & Forecasting
+lightgbm>=4.1.0
 xgboost>=2.0.3
-lightgbm>=4.3.0
-torch>=2.2
+prophet>=1.1.5
+torch>=2.2.0
+torchvision>=0.17.0
+torchaudio>=2.2.0
+statsmodels>=0.14.1
 
-prophet==1.1.5
-cmdstanpy>=1.2.4
+# Sentiment Analysis
+transformers>=4.39.0
+nltk>=3.8.1
+finbert-embedding>=1.0.0  # or custom load of finBERT
 
-yfinance>=0.2.38
-requests>=2.32.0
-streamlit>=1.33
-plotly>=5.20
-joblib>=1.3
+# Math / Stochastic / Quantum modeling
+sympy>=1.12
+scipy>=1.12.0
+quantumrandom>=1.9.0  # optional for quantum-driven RNG
+quandtum>=0.1.0        # placeholder if using quantum-specific packages
+numba>=0.59.0
 
-matplotlib>=3.7.1
-python-dotenv>=1.0.0
-ta>=0.10.0
-transformers>=4.30.0
-arima 
-prophet
-finBERT
+# Backtesting & Performance
+backtesting>=0.3.3
+ta>=0.11.0  # technical indicators
+pyfolio-reloaded>=0.9.4
+arch>=6.3.0  # for volatility modeling
+
+# Caching & Utilities
+joblib>=1.3.2
+tqdm>=4.66.2
+python-dotenv>=1.0.1
+
+# Optional data sources / APIs
+alpha_vantage>=2.3.1
+newsapi-python>=0.2.7
