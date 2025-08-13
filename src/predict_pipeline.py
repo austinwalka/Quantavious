@@ -316,13 +316,23 @@ def predict_stock(ticker,
         model_forecasts['Quantum'] = np.repeat(train['Close'].iloc[-1], forecast_days)
         rmse_scores['Quantum'] = np.nan
 
+    # Clean duplicates before adding forecasts
+    if result_df.index.duplicated().any():
+        dup_count = result_df.index.duplicated().sum()
+        print(f"[WARN] Dropping {dup_count} duplicate index rows from result_df")
+        result_df = result_df.loc[~result_df.index.duplicated(keep='first')]
+    result_df = result_df.sort_index()
+
     # Build result DataFrame
     dates = _dates_for_horizon(last_date, forecast_days)
     result_df = pd.DataFrame({'Date': dates})
     model_cols = []
     for name, arr in model_forecasts.items():
         col = name
-        result_df[col] = arr[:forecast_days]
+        result_df[col] = pd.Series(
+                arr[:forecast_days],
+                index=result_df.index[:forecast_days]
+            )
         model_cols.append(col)
 
     # Ensemble: mean across models
