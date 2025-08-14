@@ -1,5 +1,5 @@
 import streamlit as st
-from predict_pipeline import predict_stock
+from src.predict_pipeline import predict_stock
 import pandas as pd
 
 # -----------------------
