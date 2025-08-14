@@ -1,5 +1,5 @@
 import streamlit as st
-from predict_pipeline import run_prediction
+from predict_pipeline import predict_stock
 import pandas as pd
 
 # -----------------------
@@ -49,7 +49,7 @@ if run_button:
 
     for sym in symbol_list:
         try:
-            df = run_prediction(sym)
+            df = predict_stock(sym)
             df['Symbol'] = sym
             results.append(df)
         except Exception as e:
