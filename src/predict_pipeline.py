@@ -103,7 +103,7 @@ def meta_blend(predictions_dict):
 # -------------------------
 # Predict function
 # -------------------------
-def predict_stock(ticker, forecast_days=5, model_dir="models"):
+def predict_stock(ticker, model_dir="models"):
     print(f"Running predictions for {ticker}...")
 
     # Load historical price
@@ -119,7 +119,7 @@ def predict_stock(ticker, forecast_days=5, model_dir="models"):
     mu = df['Close'].pct_change().mean() * 252
     sigma = df['Close'].pct_change().std() * np.sqrt(252)
     dt = 1/252
-    T = forecast_days*dt
+    T = 5*dt
 
     # Load pre-trained models
     models = load_models(ticker, model_dir)
@@ -131,34 +131,34 @@ def predict_stock(ticker, forecast_days=5, model_dir="models"):
     predictions["GBM"] = gbm_paths.mean(axis=0)
 
     # OU / Langevin
-    ou_paths = ou_process(S0, theta=0.1, mu=S0, sigma=sigma, T=forecast_days, dt=dt, n_paths=100)
+    ou_paths = ou_process(S0, theta=0.1, mu=S0, sigma=sigma, T=5, dt=dt, n_paths=100)
     predictions["OU"] = ou_paths.mean(axis=0)
 
     # Quantum proxy
-    x, pdf = quantum_proxy(S0, sigma=sigma, T=forecast_days)
-    predictions["Quantum"] = np.interp(np.arange(forecast_days), np.linspace(0, forecast_days-1, len(x)), x)
+    x, pdf = quantum_proxy(S0, sigma=sigma, T=5)
+    predictions["Quantum"] = np.interp(np.arange(5), np.linspace(0, 5-1, len(x)), x)
 
     # Prophet
     if models.get("prophet") is not None:
-        future = models["prophet"].make_future_dataframe(periods=forecast_days)
+        future = models["prophet"].make_future_dataframe(periods=5)
         forecast = models["prophet"].predict(future)
-        predictions["Prophet"] = forecast['yhat'].iloc[-forecast_days:].values
+        predictions["Prophet"] = forecast['yhat'].iloc[-5:].values
     else:
-        predictions["Prophet"] = np.full(forecast_days, S0)
+        predictions["Prophet"] = np.full(5, S0)
 
     # LightGBM
     if models.get("lgb") is not None:
-        X_pred = np.arange(len(df), len(df)+forecast_days).reshape(-1,1)
+        X_pred = np.arange(len(df), len(df)+5).reshape(-1,1)
         predictions["LGB"] = models["lgb"].predict(X_pred)
     else:
-        predictions["LGB"] = np.full(forecast_days, S0)
+        predictions["LGB"] = np.full(5, S0)
 
     # XGBoost
     if models.get("xgb") is not None:
-        X_pred = np.arange(len(df), len(df)+forecast_days).reshape(-1,1)
+        X_pred = np.arange(len(df), len(df)+5).reshape(-1,1)
         predictions["XGB"] = models["xgb"].predict(X_pred)
     else:
-        predictions["XGB"] = np.full(forecast_days, S0)
+        predictions["XGB"] = np.full(5, S0)
 
     # LSTM
     if models.get("lstm") is not None:
@@ -166,7 +166,7 @@ def predict_stock(ticker, forecast_days=5, model_dir="models"):
         lstm_input_tensor = torch.tensor(lstm_input, dtype=torch.float32)
         lstm_pred = []
         current_seq = lstm_input_tensor
-        for _ in range(forecast_days):
+        for _ in range(5):
             out = models["lstm"](current_seq)
             lstm_pred.append(out.item())
             next_seq = np.roll(current_seq.numpy(), -1)
@@ -174,13 +174,15 @@ def predict_stock(ticker, forecast_days=5, model_dir="models"):
             current_seq = torch.tensor(next_seq, dtype=torch.float32)
         predictions["LSTM"] = np.array(lstm_pred)
     else:
-        predictions["LSTM"] = np.full(forecast_days, S0)
+        predictions["LSTM"] = np.full(5, S0)
 
     # Meta-blend
     meta = meta_blend(predictions)
 
     # Combine into DataFrame
-    result_df = pd.DataFrame(predictions)
+    result_df = pd.DataFrame(index=range(5))
+    for col, arr in predictions.items():
+        result_df[col] = arr[:5]
     result_df["MetaBlend"] = meta
 
     return result_df
