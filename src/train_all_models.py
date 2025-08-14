@@ -19,7 +19,7 @@ import torch.optim as optim
 import numpy as np
 
 # ==== CONFIG ====
-TICKERS = ["AAPL", "MSFT", "TSLA"]   # change this list as needed
+TICKERS = ["AAPL", "MSFT", "TSLA", "SCHW", "CRH", "GS", "MS", "AMZN", "GOOG", "NET", "NVDA", "AMD", "PLTR", "KO", "MO", "PO", "VZ", "PG", "JNJ", "ATO", "GIS", "FE", "WMT", "CVS", "UNH", "T"]   # change this list as needed
 SAVE_DIR = "models"
 os.makedirs(SAVE_DIR, exist_ok=True)
 
