@@ -29,6 +29,9 @@ st.markdown("""
   - **finBERT sentiment weighting** to tilt predictions toward mean-reversion or trend-following based on news sentiment.
 
 This tool is designed for **intraday and 5-day short-term forecasting** with hedge fund-style quantitative approaches.
+
+Current Tickers: AAPL, MSFT, TSLA, SCHW, CRH, GS, MS, AMZN, GOOG, NET, NVDA, AMD, PLTR, KO, MO, PM, VZ, PG, JNJ, ATO, GIS, FE, WMT, CVS, UNH, T
+
 """)
 
 # -----------------------
