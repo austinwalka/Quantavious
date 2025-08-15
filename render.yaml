@@ -1,6 +1,6 @@
 services:
   - type: web
-    name: quantavius
+    name: quantavious
     env: python
     buildCommand: pip install -r requirements.txt
     startCommand: streamlit run app.py --server.port $PORT --server.address 0.0.0.0
@@ -10,3 +10,4 @@ services:
       - key: NEWS_API_KEY
         value: 7edaec35d5be4ee8846cbec2eed677d1
         sync: false
+python-3.11.9
