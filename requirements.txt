@@ -12,8 +12,8 @@ lightgbm>=4.1.0
 xgboost>=2.0.3
 prophet>=1.1.5
 torch
-torchvision==0.17.2
-torchaudio==2.2.2
+torchvision
+torchaudio
 statsmodels>=0.14.1
 
 # Sentiment Analysis
