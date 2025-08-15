@@ -6,7 +6,10 @@ import zipfile
 from datetime import datetime
 
 # Replace this with your S&P500 or smaller list for testing
-TICKERS = ["AAPL", "MSFT", "GOOG"]
+# 3️⃣ Load S&P 500 tickers
+sp500_url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+tickers_df = pd.read_html(sp500_url)[0]
+TICKERS = [sym for sym in tickers_df['Symbol'].to_list() if '.' not in sym]
 
 MODEL_DIR = "models"
 ZIP_DIR = "zipped_models"
