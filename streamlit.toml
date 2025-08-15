@@ -1,9 +1,7 @@
 [server]
 headless = true
 enableCORS = false
-enableXsrfProtection = true
+# Don't set port here; Render injects $PORT and we pass it via start command.
+
 [browser]
 gatherUsageStats = false
-
-[theme]
-base = "dark"

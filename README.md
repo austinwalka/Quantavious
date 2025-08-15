@@ -1,6 +1,6 @@
-# Quantavius - AI Stock Ensemble Pipeline
+# Quantavious - AI Stock Ensemble Pipeline
 
-Quantavius is an AI-powered stock price prediction pipeline inspired by Ed Quantavius's quantitative trading philosophy.  
+Quantavious is an AI-powered stock price prediction pipeline inspired by Ed Quantavious's quantitative trading philosophy.  
 It combines multiple models — including gradient boosting, deep learning, and sentiment analysis — to produce predictions with uncertainty estimates.
 
 ## Features
@@ -14,8 +14,8 @@ It combines multiple models — including gradient boosting, deep learning, and 
 
 ## Installation
 ```bash
-git clone https://github.com/austinwalka/Quantavius.git
-cd Quantavius
+git clone https://github.com/austinwalka/Quantavious.git
+cd Quantavious
 python -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt

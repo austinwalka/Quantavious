@@ -1,70 +1,59 @@
-import streamlit as st
-from src.predict_pipeline import predict_stock
+import io
 import pandas as pd
+import streamlit as st
 
-# -----------------------
-# App Title & Description
-# -----------------------
-st.set_page_config(page_title="Quantavius AI", layout="wide")
+from src.predict_pipeline import run_prediction
 
-st.title("📈 Quantavious AI – Advanced Market Prediction Tool")
+st.set_page_config(page_title="Quantavious — Ensemble Stock Forecaster", layout="wide")
 
+st.title("📈 Quantavious — Ensemble Stock Forecaster")
 st.markdown("""
-### 🔍 What This App Does
+This app predicts short-term stock movements using a blended ensemble:
 
-✅ **Math-based models**
-- Geometric Brownian Motion (GBM)
-- Langevin Equation
-- Boltzmann Equation
-- Schrödinger equation time-evolution proxy (full version optional upgrade)
+**Math-based models**: GBM, OU/Langevin, Boltzmann, Schrödinger proxy  
+**Prophet**: trend & seasonality  
+**ML trees**: LightGBM, XGBoost  
+**Meta-blend**: simple average of all models
 
-✅ **Prophet**
-- Facebook Prophet for short- and medium-term trend + seasonality decomposition.
-
-✅ **Meta-blender**
-- Combines:
-  - Math-based models (GBM, OU/Langevin, Boltzmann)
-  - Machine learning models (LightGBM, XGBoost, LSTM)
-  - Prophet predictions
-  - **finBERT sentiment weighting** to tilt predictions toward mean-reversion or trend-following based on news sentiment.
-
-This tool is designed for **intraday and 5-day short-term forecasting** with hedge fund-style quantitative approaches.
-
-Current Tickers: AAPL, MSFT, TSLA, SCHW, CRH, GS, MS, AMZN, GOOG, NET, NVDA, AMD, PLTR, KO, MO, PM, VZ, PG, JNJ, ATO, GIS, FE, WMT, CVS, UNH, T
-
+Enter one or more tickers (comma-separated). Choose 1–5 days ahead for short-term forecasts.
 """)
 
-# -----------------------
-# UI Input Section
-# -----------------------
-symbols = st.text_input("Enter stock symbols (comma separated):", "AAPL, MSFT, TSLA")
-run_button = st.button("Run Predictions")
+tickers_txt = st.text_input("Tickers (comma-separated)", value="AAPL, MSFT")
+days = st.slider("Days ahead", min_value=1, max_value=5, value=5, step=1)
 
-# -----------------------
-# Prediction Execution
-# -----------------------
-if run_button:
-    symbol_list = [s.strip().upper() for s in symbols.split(",") if s.strip()]
-    results = []
+if st.button("Run predictions"):
+    tickers = [t.strip().upper() for t in tickers_txt.split(",") if t.strip()]
+    all_rows = []
+    errors = []
 
-    for sym in symbol_list:
-        try:
-            df = predict_stock(sym)
-            df['Symbol'] = sym
-            results.append(df)
-        except Exception as e:
-            st.error(f"Error processing {sym}: {e}")
+    with st.spinner("Running models..."):
+        for t in tickers:
+            try:
+                df = run_prediction(t, days=days)
+                all_rows.append(df)
+            except Exception as e:
+                errors.append(f"{t}: {e}")
 
-    if results:
-        combined_df = pd.concat(results)
-        st.subheader("📊 Prediction Results")
-        st.dataframe(combined_df)
+    if errors:
+        st.warning("Some tickers failed:\n\n" + "\n".join(f"- {e}" for e in errors))
 
-        # CSV download option
-        csv = combined_df.to_csv(index=False).encode("utf-8")
+    if all_rows:
+        results = pd.concat(all_rows, ignore_index=True)
+        st.subheader("Forecast Table")
+        st.dataframe(results, use_container_width=True)
+
+        # Simple chart: show MetaBlend by ticker
+        st.subheader("MetaBlend forecast (per ticker)")
+        for t in results["ticker"].unique():
+            st.line_chart(
+                results.loc[results["ticker"] == t, ["date", "MetaBlend"]]
+                .set_index("date")
+            )
+
+        csv = results.to_csv(index=False).encode("utf-8")
         st.download_button(
-            label="💾 Download results as CSV",
+            "Download CSV",
             data=csv,
-            file_name="predictions.csv",
-            mime="text/csv"
+            file_name="quantavious_predictions.csv",
+            mime="text/csv",
         )

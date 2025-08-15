@@ -1,188 +1,172 @@
-"""
-predict_pipeline.py
-Updated for inference-only mode with pre-trained models.
-"""
-
-import os
 import numpy as np
 import pandas as pd
-import joblib
-import torch
+import yfinance as yf
+
+# Optional: tiny lib; if absent, we continue without caching
+try:
+    import joblib  # noqa: F401
+except Exception:
+    joblib = None  # not used in this lightweight runtime
+
+# ML libs
 from prophet import Prophet
-from datetime import datetime, timedelta
+import lightgbm as lgb
+import xgboost as xgb
 
-# -------------------------
-# LSTM Model class
-# -------------------------
-import torch.nn as nn
+# --- Utilities ---------------------------------------------------------------
 
-class LSTMModel(nn.Module):
-    def __init__(self, input_size=1, hidden_size=50, num_layers=2, output_size=1):
-        super(LSTMModel, self).__init__()
-        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
-        self.fc = nn.Linear(hidden_size, output_size)
+def _fetch_history(ticker: str, period="1y", interval="1d") -> pd.DataFrame:
+    """Fetch OHLCV and return df with columns: Date, Close, ds, y."""
+    df = yf.download(ticker, period=period, interval=interval, progress=False)
+    if df.empty:
+        raise ValueError(f"No data returned for {ticker} ({period}, {interval}).")
+    df = df.reset_index()
+    # Some intervals name the index differently (Date vs Datetime)
+    date_col = "Date" if "Date" in df.columns else "Datetime"
+    df.rename(columns={date_col: "ds", "Close": "y"}, inplace=True)
+    df = df[["ds", "y"]].dropna()
+    if df.shape[0] < 10:
+        raise ValueError(f"Not enough rows for {ticker} to model (have {df.shape[0]}).")
+    return df
 
-    def forward(self, x):
-        h0 = torch.zeros(2, x.size(0), 50).to(x.device)
-        c0 = torch.zeros(2, x.size(0), 50).to(x.device)
-        out, _ = self.lstm(x, (h0, c0))
-        out = self.fc(out[:, -1, :])
-        return out
+def _future_dates(last_date: pd.Timestamp, days: int) -> pd.DatetimeIndex:
+    # Next trading days approximation (calendar days; for exact trading days integrate a calendar)
+    start = (pd.to_datetime(last_date).normalize() + pd.Timedelta(days=1))
+    return pd.date_range(start, periods=days, freq="D")
 
-# -------------------------
-# Load pre-trained ML models
-# -------------------------
-def load_models(ticker, model_dir="models"):
-    models = {}
-    try:
-        models["lgb"] = joblib.load(os.path.join(model_dir, f"{ticker}_lgb.pkl"))
-    except:
-        models["lgb"] = None
-    try:
-        models["xgb"] = joblib.load(os.path.join(model_dir, f"{ticker}_xgb.pkl"))
-    except:
-        models["xgb"] = None
-    try:
-        prophet_model = joblib.load(os.path.join(model_dir, f"{ticker}_prophet.pkl"))
-        models["prophet"] = prophet_model
-    except:
-        models["prophet"] = None
-    try:
-        lstm_model = LSTMModel()
-        lstm_model.load_state_dict(torch.load(os.path.join(model_dir, f"{ticker}_lstm.pt"), map_location=torch.device('cpu')))
-        lstm_model.eval()
-        models["lstm"] = lstm_model
-    except:
-        models["lstm"] = None
-    return models
+# --- Math models -------------------------------------------------------------
 
-# -------------------------
-# Math-based models
-# -------------------------
-def gbm_simulation(S0, mu, sigma, T, dt=1/252, n_paths=1000):
-    N = int(T / dt)
-    t = np.linspace(0, T, N+1)
-    dW = np.random.standard_normal(size=(n_paths, N)) * np.sqrt(dt)
-    W = np.cumsum(dW, axis=1)
-    exp_term = (mu - 0.5*sigma**2) * t[1:]
-    paths = S0 * np.exp(np.hstack([np.zeros((n_paths,1)), exp_term[np.newaxis,:] + sigma * W]))
-    return paths
+def _gbm_series(S0, mu, sigma, days):
+    dt = 1 / 252
+    prices = [S0]
+    for _ in range(days):
+        dW = np.random.normal(scale=np.sqrt(dt))
+        next_S = prices[-1] * np.exp((mu - 0.5 * sigma**2) * dt + sigma * dW)
+        prices.append(next_S)
+    return np.array(prices[1:])
 
-def ou_process(S0, theta=0.1, mu=0, sigma=0.02, T=5, dt=1/252, n_paths=1000):
-    N = int(T/dt)
-    paths = np.zeros((n_paths, N+1))
-    paths[:,0] = S0
-    for t in range(1, N+1):
-        dS = theta*(mu - paths[:,t-1])*dt + sigma*np.random.randn(n_paths)*np.sqrt(dt)
-        paths[:,t] = paths[:,t-1] + dS
-    return paths
+def _ou_series(S0, mu, theta, sigma, days):
+    dt = 1 / 252
+    x = [S0]
+    for _ in range(days):
+        dx = theta * (mu - x[-1]) * dt + sigma * np.sqrt(dt) * np.random.normal()
+        x.append(x[-1] + dx)
+    return np.array(x[1:])
 
-# Placeholder for Schrödinger / Boltzmann etc. proxy
-def quantum_proxy(S0, sigma=0.02, T=5, n_points=1000):
-    # Simple normal distribution as proxy for PDF
-    x = np.linspace(S0*(1-3*sigma), S0*(1+3*sigma), n_points)
-    pdf = np.exp(-0.5*((x-S0)/(sigma*S0))**2)
-    pdf /= pdf.sum()
-    return x, pdf
+def _boltzmann_proxy_series(S0, days):
+    # simple small random kicks; proxy for energy diffusion
+    shocks = np.random.normal(0, 0.006, size=days)  # ~0.6% daily stdev
+    return S0 * (1 + shocks).cumprod()
 
-# -------------------------
-# Meta-blend
-# -------------------------
-def meta_blend(predictions_dict):
-    # Simple average across available model outputs
-    blended = np.zeros_like(next(iter(predictions_dict.values())))
-    count = 0
-    for key, arr in predictions_dict.items():
-        if arr is not None:
-            blended += arr
-            count += 1
-    if count > 0:
-        blended /= count
-    return blended
+def _schrodinger_proxy_series(S0, days):
+    # proxy w/ slightly fatter tails than boltzmann
+    shocks = np.random.normal(0, 0.009, size=days)
+    return S0 * (1 + shocks).cumprod()
 
-# -------------------------
-# Predict function
-# -------------------------
-def predict_stock(ticker, model_dir="models"):
-    print(f"Running predictions for {ticker}...")
+# --- Prophet ----------------------------------------------------------------
 
-    # Load historical price
-    end = datetime.today()
-    start = end - timedelta(days=365*3)
-    try:
-        import yfinance as yf
-        df = yf.download(ticker, start=start, end=end)
-    except:
-        raise RuntimeError("Error fetching data for ticker")
+def _prophet_series(hist_df: pd.DataFrame, days: int) -> np.ndarray:
+    m = Prophet(daily_seasonality=True, weekly_seasonality=True)
+    m.fit(hist_df.rename(columns={"ds": "ds", "y": "y"}))
+    future = m.make_future_dataframe(periods=days, freq="D", include_history=False)
+    fc = m.predict(future)
+    return fc["yhat"].to_numpy()
 
-    S0 = df['Close'].iloc[-1]
-    mu = df['Close'].pct_change().mean() * 252
-    sigma = df['Close'].pct_change().std() * np.sqrt(252)
-    dt = 1/252
-    T = 5*dt
+# --- Lightweight ML (no deep learning) --------------------------------------
 
-    # Load pre-trained models
-    models = load_models(ticker, model_dir)
+def _build_basic_features(df: pd.DataFrame) -> pd.DataFrame:
+    tmp = df.copy()
+    tmp["t"] = np.arange(len(tmp))
+    tmp["ret"] = tmp["y"].pct_change().fillna(0.0)
+    tmp["ma5"] = tmp["y"].rolling(5).mean().bfill()
+    tmp["ma10"] = tmp["y"].rolling(10).mean().bfill()
+    tmp["std5"] = tmp["y"].rolling(5).std().bfill().fillna(0.0)
+    tmp["std10"] = tmp["y"].rolling(10).std().bfill().fillna(0.0)
+    return tmp
 
-    predictions = {}
+def _future_feature_frame(last_row: pd.Series, start_t: int, days: int) -> pd.DataFrame:
+    # We only extrapolate 't'; MAs/stds are unknown for the future – the trees still use time index.
+    future = pd.DataFrame({"t": np.arange(start_t + 1, start_t + 1 + days)})
+    # Fill placeholder numeric columns used in training (keeps columns aligned)
+    for col in ["ret", "ma5", "ma10", "std5", "std10"]:
+        future[col] = float(last_row[col]) if col in last_row else 0.0
+    return future
 
-    # GBM
-    gbm_paths = gbm_simulation(S0, mu, sigma, T, dt, n_paths=100)
-    predictions["GBM"] = gbm_paths.mean(axis=0)
+def _lgb_series(feat: pd.DataFrame, y: pd.Series, days: int) -> np.ndarray:
+    X = feat[["t", "ret", "ma5", "ma10", "std5", "std10"]]
+    model = lgb.LGBMRegressor(
+        n_estimators=400,
+        learning_rate=0.05,
+        subsample=0.9,
+        colsample_bytree=0.9,
+        random_state=42,
+    )
+    model.fit(X, y)
+    future_X = _future_feature_frame(feat.iloc[-1], feat["t"].iloc[-1], days)[X.columns]
+    return model.predict(future_X)
 
-    # OU / Langevin
-    ou_paths = ou_process(S0, theta=0.1, mu=S0, sigma=sigma, T=5, dt=dt, n_paths=100)
-    predictions["OU"] = ou_paths.mean(axis=0)
+def _xgb_series(feat: pd.DataFrame, y: pd.Series, days: int) -> np.ndarray:
+    X = feat[["t", "ret", "ma5", "ma10", "std5", "std10"]]
+    model = xgb.XGBRegressor(
+        n_estimators=400,
+        max_depth=6,
+        learning_rate=0.05,
+        subsample=0.9,
+        colsample_bytree=0.9,
+        objective="reg:squarederror",
+        random_state=42,
+        n_jobs=2,
+    )
+    model.fit(X, y)
+    future_X = _future_feature_frame(feat.iloc[-1], feat["t"].iloc[-1], days)[X.columns]
+    return model.predict(future_X)
 
-    # Quantum proxy
-    x, pdf = quantum_proxy(S0, sigma=sigma, T=5)
-    predictions["Quantum"] = np.interp(np.arange(5), np.linspace(0, 5-1, len(x)), x)
+# --- Public API --------------------------------------------------------------
+
+def run_prediction(ticker: str, days: int = 5) -> pd.DataFrame:
+    """
+    Returns a tidy DataFrame with one row per forecast day and columns:
+      ['ticker','date','GBM','OU','Boltzmann','Schrodinger','Prophet','LightGBM','XGBoost','MetaBlend']
+    """
+    hist = _fetch_history(ticker, period="1y", interval="1d")
+    last_price = float(hist["y"].iloc[-1])
+    last_date = pd.to_datetime(hist["ds"].iloc[-1])
+    future_dates = _future_dates(last_date, days)
+
+    # Params for math models
+    ret = hist["y"].pct_change().dropna()
+    mu = float(ret.mean()) if len(ret) else 0.0
+    sigma = float(ret.std()) if len(ret) else 0.02
+    theta = 0.5  # OU pull-to-mean
+
+    # Math series
+    gbm = _gbm_series(last_price, mu, sigma, days)
+    ou = _ou_series(last_price, last_price, theta, sigma, days)
+    boltz = _boltzmann_proxy_series(last_price, days)
+    sch = _schrodinger_proxy_series(last_price, days)
 
     # Prophet
-    if models.get("prophet") is not None:
-        future = models["prophet"].make_future_dataframe(periods=5)
-        forecast = models["prophet"].predict(future)
-        predictions["Prophet"] = forecast['yhat'].iloc[-5:].values
-    else:
-        predictions["Prophet"] = np.full(5, S0)
+    prop = _prophet_series(hist[["ds", "y"]], days)
 
-    # LightGBM
-    if models.get("lgb") is not None:
-        X_pred = np.arange(len(df), len(df)+5).reshape(-1,1)
-        predictions["LGB"] = models["lgb"].predict(X_pred)
-    else:
-        predictions["LGB"] = np.full(5, S0)
+    # ML trees
+    feat = _build_basic_features(hist[["ds", "y"]].copy())
+    lgb_ser = _lgb_series(feat, feat["y"], days)
+    xgb_ser = _xgb_series(feat, feat["y"], days)
 
-    # XGBoost
-    if models.get("xgb") is not None:
-        X_pred = np.arange(len(df), len(df)+5).reshape(-1,1)
-        predictions["XGB"] = models["xgb"].predict(X_pred)
-    else:
-        predictions["XGB"] = np.full(5, S0)
+    # Meta-blend (equal weights to keep simple)
+    stack = np.vstack([gbm, ou, boltz, sch, prop, lgb_ser, xgb_ser])
+    meta = stack.mean(axis=0)
 
-    # LSTM
-    if models.get("lstm") is not None:
-        lstm_input = df['Close'].values[-10:].reshape(1,10,1)
-        lstm_input_tensor = torch.tensor(lstm_input, dtype=torch.float32)
-        lstm_pred = []
-        current_seq = lstm_input_tensor
-        for _ in range(5):
-            out = models["lstm"](current_seq)
-            lstm_pred.append(out.item())
-            next_seq = np.roll(current_seq.numpy(), -1)
-            next_seq[0,-1,0] = out.item()
-            current_seq = torch.tensor(next_seq, dtype=torch.float32)
-        predictions["LSTM"] = np.array(lstm_pred)
-    else:
-        predictions["LSTM"] = np.full(5, S0)
-
-    # Meta-blend
-    meta = meta_blend(predictions)
-
-    # Combine into DataFrame
-    result_df = pd.DataFrame(index=range(1))
-    for col, arr in predictions.items():
-        result_df[col] = arr[:1]
-    result_df["MetaBlend"] = meta[:1]
-
-    return result_df
+    out = pd.DataFrame({
+        "ticker": ticker,
+        "date": future_dates,
+        "GBM": gbm,
+        "OU": ou,
+        "Boltzmann": boltz,
+        "Schrodinger": sch,
+        "Prophet": prop,
+        "LightGBM": lgb_ser,
+        "XGBoost": xgb_ser,
+        "MetaBlend": meta,
+    })
+    return out
