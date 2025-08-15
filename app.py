@@ -1,59 +1,51 @@
-import io
-import pandas as pd
 import streamlit as st
+import pandas as pd
+from src.predict_pipeline import predict_stock
 
-from src.predict_pipeline import run_prediction
+st.set_page_config(page_title="Quantavius Stock Predictor", layout="wide")
 
-st.set_page_config(page_title="Quantavious — Ensemble Stock Forecaster", layout="wide")
-
-st.title("📈 Quantavious — Ensemble Stock Forecaster")
-st.markdown("""
-This app predicts short-term stock movements using a blended ensemble:
-
-**Math-based models**: GBM, OU/Langevin, Boltzmann, Schrödinger proxy  
-**Prophet**: trend & seasonality  
-**ML trees**: LightGBM, XGBoost  
-**Meta-blend**: simple average of all models
-
-Enter one or more tickers (comma-separated). Choose 1–5 days ahead for short-term forecasts.
+st.title("📈 Quantavius Stock Predictor")
+st.write("""
+This app predicts stock prices using:
+- **Math-based models**: Geometric Brownian Motion, Langevin, Boltzmann, Schrödinger proxy
+- **Machine learning**: LightGBM, XGBoost, LSTM
+- **Prophet** for trend/seasonality
+- **Meta-blender** to combine results
 """)
 
-tickers_txt = st.text_input("Tickers (comma-separated)", value="AAPL, MSFT")
-days = st.slider("Days ahead", min_value=1, max_value=5, value=5, step=1)
+tickers_input = st.text_input(
+    "Enter stock ticker(s) (comma-separated)", 
+    value="AAPL"
+)
+run_btn = st.button("Run Predictions")
 
-if st.button("Run predictions"):
-    tickers = [t.strip().upper() for t in tickers_txt.split(",") if t.strip()]
-    all_rows = []
-    errors = []
+if run_btn:
+    tickers = [t.strip().upper() for t in tickers_input.split(",") if t.strip()]
+    results_all = []
 
-    with st.spinner("Running models..."):
-        for t in tickers:
-            try:
-                df = run_prediction(t, days=days)
-                all_rows.append(df)
-            except Exception as e:
-                errors.append(f"{t}: {e}")
+    for ticker in tickers:
+        st.subheader(f"Ticker: {ticker}")
+        try:
+            # TODO: replace with your real features for this ticker
+            fake_features = pd.DataFrame([[0.1, 0.2, 0.3, 0.4]])
+            df_pred = predict_stock(ticker, fake_features)
 
-    if errors:
-        st.warning("Some tickers failed:\n\n" + "\n".join(f"- {e}" for e in errors))
+            results_all.append(df_pred)
 
-    if all_rows:
-        results = pd.concat(all_rows, ignore_index=True)
-        st.subheader("Forecast Table")
-        st.dataframe(results, use_container_width=True)
+            if len(df_pred) > 1:
+                st.line_chart(df_pred.set_index("date")["prediction"])
+            st.dataframe(df_pred)
 
-        # Simple chart: show MetaBlend by ticker
-        st.subheader("MetaBlend forecast (per ticker)")
-        for t in results["ticker"].unique():
-            st.line_chart(
-                results.loc[results["ticker"] == t, ["date", "MetaBlend"]]
-                .set_index("date")
-            )
+        except Exception as e:
+            st.error(f"Error processing {ticker}: {e}")
 
-        csv = results.to_csv(index=False).encode("utf-8")
+    if results_all:
+        combined = pd.concat(results_all, ignore_index=True)
+        csv = combined.to_csv(index=False).encode("utf-8")
         st.download_button(
-            "Download CSV",
-            data=csv,
-            file_name="quantavious_predictions.csv",
-            mime="text/csv",
+            "Download all results as CSV",
+            csv,
+            "predictions.csv",
+            "text/csv",
+            key="download-csv"
         )
