@@ -7,7 +7,7 @@ import pandas as pd
 # -----------------------
 st.set_page_config(page_title="Quantavius AI", layout="wide")
 
-st.title("📈 Quantavius AI – Advanced Market Prediction Tool")
+st.title("📈 Quantavious AI – Advanced Market Prediction Tool")
 
 st.markdown("""
 ### 🔍 What This App Does
