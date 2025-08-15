@@ -180,9 +180,9 @@ def predict_stock(ticker, model_dir="models"):
     meta = meta_blend(predictions)
 
     # Combine into DataFrame
-    result_df = pd.DataFrame(index=range(5))
+    result_df = pd.DataFrame(index=range(1))
     for col, arr in predictions.items():
-        result_df[col] = arr[:5]
-    result_df["MetaBlend"] = meta
+        result_df[col] = arr[:1]
+    result_df["MetaBlend"] = meta[:1]
 
     return result_df
