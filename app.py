@@ -93,3 +93,73 @@ if run_button:
 # 90-Day Technical Indicator Chart
 # ---------------------
 
+st.subheader(f"{ticker} - Last 90 Days Technical Indicators & Candlesticks")
+
+try:
+    # Download last 90 days
+    df_90 = yf.download(ticker, period="90d", interval="1d")
+    if not df_90.empty:
+        df_90 = compute_indicators(df_90)
+
+        # MACD signal line
+        if 'MACD_signal' not in df_90.columns and 'MACD' in df_90.columns:
+            from ta.trend import MACD
+            macd = MACD(df_90['Close'])
+            df_90['MACD'] = macd.macd()
+            df_90['MACD_signal'] = macd.macd_signal()
+
+        df_plot = df_90.tail(90).copy()
+        fig = go.Figure()
+
+        # Candlestick
+        if all(c in df_plot.columns for c in ['Open','High','Low','Close']):
+            fig.add_trace(go.Candlestick(
+                x=df_plot.index,
+                open=df_plot['Open'],
+                high=df_plot['High'],
+                low=df_plot['Low'],
+                close=df_plot['Close'],
+                name='Candlestick'
+            ))
+
+        # Indicator lines
+        indicator_lines = {
+            'SMA20': {'color':'orange'},
+            'BB_upper': {'color':'green', 'dash':'dash'},
+            'BB_lower': {'color':'red', 'dash':'dash'},
+            'RSI': {'color':'purple', 'yaxis':'y2'},
+            'MACD': {'color':'blue', 'yaxis':'y3'},
+            'MACD_signal': {'color':'red', 'dash':'dash', 'yaxis':'y3'}
+        }
+
+        for ind, opts in indicator_lines.items():
+            if ind in df_plot.columns:
+                line_props = dict(color=opts.get('color', 'black'))
+                if 'dash' in opts:
+                    line_props['dash'] = opts['dash']
+                fig.add_trace(go.Scatter(
+                    x=df_plot.index,
+                    y=df_plot[ind],
+                    mode='lines',
+                    name=ind,
+                    line=line_props,
+                    yaxis=opts.get('yaxis', 'y')
+                ))
+
+        # Layout
+        fig.update_layout(
+            title=f"{ticker} - Last 90 Days Technical Chart",
+            xaxis=dict(title='Date'),
+            yaxis=dict(title='Price'),
+            yaxis2=dict(title='RSI', overlaying='y', side='right', range=[0,100]) if 'RSI' in df_plot.columns else None,
+            yaxis3=dict(title='MACD', overlaying='y', side='right', position=0.95) if 'MACD' in df_plot.columns else None,
+            legend=dict(orientation='h'),
+            height=600
+        )
+
+        st.plotly_chart(fig)
+    else:
+        st.warning(f"No recent data for {ticker}")
+
+except Exception as e:
+    st.error(f"Failed to generate chart: {e}")
