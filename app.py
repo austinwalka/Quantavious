@@ -1,38 +1,38 @@
 import streamlit as st
 import pandas as pd
 from src.predict_pipeline import predict_stock
+import yfinance as yf
 
-st.set_page_config(page_title="Quantavius", layout="wide")
+# Load S&P 500 tickers and filter out tickers with "."
+sp500_url = "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies"
+tickers_df = pd.read_html(sp500_url)[0]
+TICKERS = [t for t in tickers_df['Symbol'].to_list() if '.' not in t]
 
-st.title("Quantavius: Multi-Model Stock Forecasts")
-st.markdown("""
-This app forecasts short-term stock prices using:
+st.title("S&P 500 Stock Prediction Dashboard")
 
-✅ Math-based models (GBM, OU/Langevin, Boltzmann, Schrödinger proxy)  
-✅ Prophet (trend + seasonality)  
-✅ Machine Learning models (LSTM, LightGBM, XGBoost placeholders)  
-✅ Meta-blender combining all predictions  
+all_results = []
 
-Batch mode allows multiple tickers.
-""")
+# Run predictions for each ticker
+for ticker in TICKERS:
+    try:
+        result = predict_stock(ticker, retrain_if_missing=False)  # only retrain if needed
+        if result:
+            result["Ticker"] = ticker
+            all_results.append(result)
+    except Exception as e:
+        st.write(f"Error processing {ticker}: {e}")
 
-tickers_input = st.text_area("Enter tickers separated by commas", "AAPL,MSFT,GOOG")
-tickers = [t.strip().upper() for t in tickers_input.split(",")]
-
-forecast_days = st.number_input("Forecast days (short-term)", min_value=1, max_value=30, value=5)
-
-if st.button("Run Forecasts"):
-    all_results = {}
-    for ticker in tickers:
-        try:
-            results = predict_stock(ticker, forecast_days=forecast_days)
-            all_results[ticker] = results
-        except Exception as e:
-            st.error(f"Error processing {ticker}: {e}")
-
-    df = pd.DataFrame(all_results).T
+# Convert results to DataFrame (safe from scalar value error)
+if all_results:
+    df = pd.DataFrame(all_results)
+    df = df[["Ticker", "Last Close", "Predicted Price", "GBM", "OU", "Schrodinger", "Prediction Date"]]
     st.dataframe(df)
+else:
+    st.warning("No predictions generated. Check model files or data source.")
 
-    # Download CSV
-    csv = df.to_csv().encode('utf-8')
-    st.download_button("Download CSV", csv, file_name="forecast_results.csv", mime="text/csv")
+# Optional: Let user pick a ticker and see chart
+st.subheader("Stock Price History")
+selected_ticker = st.selectbox("Select a Ticker", TICKERS)
+if selected_ticker:
+    hist = yf.download(selected_ticker, period="6mo", interval="1d")
+    st.line_chart(hist["Close"])
