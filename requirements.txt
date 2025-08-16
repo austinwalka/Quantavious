@@ -27,3 +27,13 @@ matplotlib>=3.7
 scipy>=1.11
 requests>=2.31
 streamlit>=1.30.0
+
+arch>=5.3.0
+hmmlearn>=0.4.0
+ta>=0.10.0
+
+tensorflow   # only if you want LSTM to run on Render
+finbert-embedding   # optional; only if using use_finbert
+beautifulsoup4
+requests
+plotly
