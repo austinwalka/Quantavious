@@ -1,6 +1,6 @@
 import streamlit as st
 import pandas as pd
-from src.predict_pipeline import predict_stock, load_model
+from src.predict_pipeline import predict_stock
 
 st.set_page_config(page_title="Quantavius", layout="wide")
 
