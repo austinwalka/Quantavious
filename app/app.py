@@ -90,16 +90,10 @@ if run_button:
 
             fig = go.Figure()
 
-            # Ensure 'Date' exists; if not, use index
-            if "Date" in df_ind.columns:
-                x_values = df_ind["Date"]
-            else:
-                x_values = df_ind.index
-
             # Candlestick
             if {"Open", "High", "Low", "Close"}.issubset(df_ind.columns):
                 fig.add_trace(go.Candlestick(
-                    x=x_values,
+                    x=df_ind["date"],
                     open=df_ind["Open"],
                     high=df_ind["High"],
                     low=df_ind["Low"],
@@ -110,14 +104,14 @@ if run_button:
             # Bollinger Bands (shaded)
             if {"BB_upper", "BB_lower"}.issubset(df_ind.columns):
                 fig.add_trace(go.Scatter(
-                    x=x_values,
+                    x=df_ind["date"],
                     y=df_ind["BB_upper"],
                     line=dict(color="lightgray"),
                     name="BB Upper",
                     showlegend=False
                 ))
                 fig.add_trace(go.Scatter(
-                    x=x_values,
+                    x=df_ind["Date"],
                     y=df_ind["BB_lower"],
                     line=dict(color="lightgray"),
                     fill="tonexty",
@@ -126,16 +120,10 @@ if run_button:
                     showlegend=True
                 ))
 
-            # Ensure 'Date' exists; if not, use index
-            if "Date" in df_forecast.columns:
-                f_values = df_forecast["Date"]
-            else:
-                f_values = df_forecast.index
-
             # Forecast line
             fig.add_trace(go.Scatter(
-                x=f_values,
-                y=df_forecast["Price_Forecast"],
+                x=df_forecast["date"],
+                y=df_forecast["blended"],
                 mode="lines+markers",
                 line=dict(color="red", dash="dash"),
                 name="Meta-Blended Forecast"
@@ -143,8 +131,8 @@ if run_button:
 
             # Shaded forecast region
             fig.add_vrect(
-                x0=f_values.iloc[0],
-                x1=f_values.iloc[-1],
+                x0=df_forecast["date"].iloc[0],
+                x1=df_forecast["date"].iloc[-1],
                 fillcolor="yellow",
                 opacity=0.1,
                 layer="below",
@@ -152,17 +140,10 @@ if run_button:
                 annotation_text="Forecast Region"
             )
 
-            # Ensure 'Date' exists; if not, use index
-            if "Date" in df_crash.columns:
-                c_values = df_crash["Date"]
-            else:
-                c_values = df_crash.index
-
-
             # Crash probability as secondary y-axis
             fig.add_trace(go.Scatter(
-                x=c_values,
-                y=df_crash["Crash_Prob"]*100,
+                x=df_crash["date"],
+                y=df_crash["p_crash"]*100,
                 mode="lines+markers",
                 line=dict(color="purple"),
                 name="Crash Probability (%)",
