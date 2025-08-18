@@ -90,10 +90,16 @@ if run_button:
 
             fig = go.Figure()
 
+            # Ensure 'Date' exists; if not, use index
+            if "Date" in df_ind.columns:
+                x_values = df_ind["Date"]
+            else:
+                x_values = df_ind.index
+                
             # Candlestick
             if {"Open", "High", "Low", "Close"}.issubset(df_ind.columns):
                 fig.add_trace(go.Candlestick(
-                    x=df_ind["Date"],
+                    x=x_values,
                     open=df_ind["Open"],
                     high=df_ind["High"],
                     low=df_ind["Low"],
@@ -104,14 +110,14 @@ if run_button:
             # Bollinger Bands (shaded)
             if {"BB_upper", "BB_lower"}.issubset(df_ind.columns):
                 fig.add_trace(go.Scatter(
-                    x=df_ind["Date"],
+                    x=x_values,
                     y=df_ind["BB_upper"],
                     line=dict(color="lightgray"),
                     name="BB Upper",
                     showlegend=False
                 ))
                 fig.add_trace(go.Scatter(
-                    x=df_ind["Date"],
+                    x=x_values,
                     y=df_ind["BB_lower"],
                     line=dict(color="lightgray"),
                     fill="tonexty",
