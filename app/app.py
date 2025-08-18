@@ -95,7 +95,7 @@ if run_button:
                 x_values = df_ind["Date"]
             else:
                 x_values = df_ind.index
-                
+
             # Candlestick
             if {"Open", "High", "Low", "Close"}.issubset(df_ind.columns):
                 fig.add_trace(go.Candlestick(
@@ -126,9 +126,15 @@ if run_button:
                     showlegend=True
                 ))
 
+            # Ensure 'Date' exists; if not, use index
+            if "Date" in df_forecast.columns:
+                f_values = df_forecast["Date"]
+            else:
+                f_values = df_forecast.index
+
             # Forecast line
             fig.add_trace(go.Scatter(
-                x=df_forecast["Date"],
+                x=f_values,
                 y=df_forecast["Price_Forecast"],
                 mode="lines+markers",
                 line=dict(color="red", dash="dash"),
@@ -137,8 +143,8 @@ if run_button:
 
             # Shaded forecast region
             fig.add_vrect(
-                x0=df_forecast["Date"].iloc[0],
-                x1=df_forecast["Date"].iloc[-1],
+                x0=f_values.iloc[0],
+                x1=f_values.iloc[-1],
                 fillcolor="yellow",
                 opacity=0.1,
                 layer="below",
@@ -146,9 +152,16 @@ if run_button:
                 annotation_text="Forecast Region"
             )
 
+            # Ensure 'Date' exists; if not, use index
+            if "Date" in df_crash.columns:
+                c_values = df_crash["Date"]
+            else:
+                c_values = df_crash.index
+
+
             # Crash probability as secondary y-axis
             fig.add_trace(go.Scatter(
-                x=df_crash["Date"],
+                x=c_values,
                 y=df_crash["Crash_Prob"]*100,
                 mode="lines+markers",
                 line=dict(color="purple"),
