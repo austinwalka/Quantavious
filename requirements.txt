@@ -1,5 +1,5 @@
 # Streamlit app
-streamlit==1.25.0
+streamlit
 plotly==5.18.0
 pandas==2.1.0
 numpy==1.26.0
