@@ -129,6 +129,42 @@ if run_button:
                 name="Meta-Blended Forecast"
             ))
 
+             # Forecast line
+            fig.add_trace(go.Scatter(
+                x=df_forecast["date"],
+                y=df_forecast["gbm"],
+                mode="lines+markers",
+                line=dict(color="blue", dash="dash"),
+                name="GBM Forecast"
+            ))
+
+            # Forecast line
+            fig.add_trace(go.Scatter(
+                x=df_forecast["date"],
+                y=df_forecast["ou"],
+                mode="lines+markers",
+                line=dict(color="green", dash="dash"),
+                name="OU Forecast"
+            ))
+
+            # Forecast line
+            fig.add_trace(go.Scatter(
+                x=df_forecast["date"],
+                y=df_forecast["lstm"],
+                mode="lines+markers",
+                line=dict(color="orange", dash="dash"),
+                name="LSTM Forecast"
+            ))
+
+            # Forecast line
+            fig.add_trace(go.Scatter(
+                x=df_forecast["date"],
+                y=df_forecast["finbert_adjust_ref"],
+                mode="lines+markers",
+                line=dict(color="lightblue", dash="dash"),
+                name="FinBERT Adjusted Reference"
+            ))
+
             # Shaded forecast region
             fig.add_vrect(
                 x0=df_forecast["date"].iloc[0],
@@ -162,8 +198,8 @@ if run_button:
             st.plotly_chart(fig, use_container_width=True)
 
             # --------- Individual Model Contributions ---------
-            st.subheader("Individual Model Contributions")
-            st.dataframe(pd.DataFrame(data["meta"]))
+            #st.subheader("Individual Model Contributions")
+            #st.dataframe(pd.DataFrame(data["meta"]))
 
             # --------- Technical Indicators ---------
             st.subheader("Recent Technical Indicators")
