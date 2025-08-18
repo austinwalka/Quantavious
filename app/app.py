@@ -2,128 +2,158 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+import yfinance as yf
 import plotly.graph_objs as go
-from datetime import datetime
-from utils import trigger_colab_retrain
-from predict_pipeline import load_stock_predictions
+from utils import load_colab_predictions
+from ta.momentum import RSIIndicator
+from ta.trend import MACD
 
 # ---------------------
 # App Description
 # ---------------------
 st.set_page_config(page_title="Quantavious", layout="wide")
-st.title("Quantavious by Austin Walker: Advanced Stock Forecasting & Crash Risk")
+st.title("Quantavious by Austin Walker: Advanced Stock Forecasting & Risk Analysis")
 
 st.markdown("""
-**Quantavious** is a kitchen-sink approach to predicting **short- to medium-term stock price movements** and **crash risk**:
+This app predicts short- and medium-term stock price movements using a **kitchen-sink approach**:
 
-**1) Math-based Models (20% weight)**  
-- Deterministic scores based on GARCH volatility, EVT tail index, HMM regimes, VIX term slope, and breadth crashiness  
-- Combined into a normalized risk score [0,1]  
+**Math-based Models**
+- Geometric Brownian Motion (GBM) – stochastic trend
+- Langevin Equation – mean-reverting dynamics
+- Boltzmann Equation – volatility-driven stochastic paths
+- Schrödinger Equation proxy – captures uncertainty as spread evolution
 
-**2) LSTM Sequence Model (50% weight)**  
-- Trained on daily features (past 60 days of prices, vol, and indicators)  
-- Predicts probability of next-day crash  
-- Supports walk-forward training and cross-validation  
+**Machine Learning Models**
+- LSTM – deep recurrent network for sequential price modeling
+- Gradient Boosting / Random Forest – ensemble-based predictions
+- FinBERT sentiment (if available) – maps news sentiment to risk signal
 
-**3) FinBERT Sentiment Model (30% weight)**  
-- Uses headlines to compute daily sentiment features (neg/pos mean, ratios, volume)  
-- Maps sentiment to crash risk signal  
+**Technical Indicators**
+- RSI, MACD, SMA20, Bollinger Bands
 
-**Meta-Blender**  
-- Weighted combination: 0.2*math + 0.5*LSTM + 0.3*FinBERT  
-- Produces a **blended price forecast** and **daily crash risk probability**  
+**Meta-blender**
+- Combines all model outputs into a single “best guess” forecast
+- Weighted by sentiment to tilt toward trend or mean-reversion
 
-**Technical Indicators**  
-- SMA20, Bollinger Bands, RSI, MACD, EMA, etc.  
-- Shown alongside price predictions for context  
+**Crash Risk**
+- EVT/GARCH-style risk predictions for next 30 days
 
-**Backtesting**  
-- Optional walk-forward RMSE evaluation for historical accuracy  
+**Backtesting**
+- Walk-forward RMSE evaluation for historical accuracy
 
-**Workflow in Streamlit**  
-- Loads **precomputed predictions and crash risk from Colab**  
-- Warns if the stock is missing or data is >1 day old  
-- Lets user open Colab notebook to retrain if needed  
-- Displays 30-day forecast, daily crash probability, individual model contributions, and indicators
+**Usage**
+- Enter a stock ticker
+- Hit **Predict** to run models and see outputs
+- Forecast horizon is **fixed at 30 days**
 """)
 
 # ---------------------
 # Sidebar Inputs
 # ---------------------
 st.sidebar.header("Stock Forecast Parameters")
-ticker = st.sidebar.text_input("Enter Stock Ticker (e.g., AAPL, BRK.B)", value="AAPL").upper()
+ticker = st.sidebar.text_input("Enter Stock Ticker (e.g., AAPL)", value="AAPL").upper()
+run_button = st.sidebar.button("Predict")
 
-forecast_days = 30  # fixed for day-by-day predictions
-
-run_button = st.sidebar.button("Load Predictions")
-
-colab_notebook_url = "https://colab.research.google.com/drive/1-liW2v2mK56QY5TfxrGlMq2v2JXN5iVw#scrollTo=fa2iby4eEXxU"  # Replace with your Colab notebook URL
+FORECAST_DAYS = 30  # Fixed horizon
 
 # ---------------------
 # Main Forecast Logic
 # ---------------------
 if run_button:
     with st.spinner(f"Loading predictions for {ticker}..."):
-        df_pred, is_stale = load_stock_predictions(ticker)
-        if df_pred is None:
-            st.error(f"No prediction data found for {ticker}.")
-            st.button("Retrain in Colab", on_click=trigger_colab_retrain, args=(colab_notebook_url,))
+        result = load_colab_predictions(ticker)
+
+        if result is None:
+            st.error(f"Could not load forecast for {ticker}. Make sure the file exists or Google Drive link is correct.")
         else:
-            if is_stale:
-                st.warning(f"Prediction data for {ticker} is older than 1 day. Consider retraining.")
-                st.button("Retrain in Colab", on_click=trigger_colab_retrain, args=(colab_notebook_url,))
+            blended = result["predictions"][:FORECAST_DAYS]
+            individual = result["individual"]
+            crash_risk = result["crash_risk"][:FORECAST_DAYS]
 
-            # ---------------------
-            # Blended Forecast & Crash Risk
-            # ---------------------
-            st.subheader(f"{ticker} - 30-Day Blended Price Forecast & Crash Risk")
-            fig = go.Figure()
-            fig.add_trace(go.Scatter(
-                x=df_pred["Day"],
-                y=df_pred["Blended_Price"],
-                mode="lines+markers",
-                name="Blended Price",
-                line=dict(color="blue", width=2)
-            ))
-            fig.add_trace(go.Bar(
-                x=df_pred["Day"],
-                y=df_pred["Crash_Risk"]*100,
-                name="Crash Risk (%)",
-                marker_color="red",
-                opacity=0.4,
-                yaxis="y2"
-            ))
-            fig.update_layout(
-                title=f"{ticker} - 30-Day Forecast & Crash Risk",
-                xaxis_title="Day",
-                yaxis_title="Price",
-                yaxis2=dict(title="Crash Risk (%)", overlaying="y", side="right", range=[0,100]),
-                legend=dict(orientation="h"),
-                height=600
-            )
-            st.plotly_chart(fig)
+            # Display blended prediction
+            st.subheader(f"Meta-blended Forecast for {ticker} ({FORECAST_DAYS} days)")
+            df_pred = pd.DataFrame({
+                "Day": np.arange(1, FORECAST_DAYS+1),
+                "Price Forecast": blended
+            })
+            st.line_chart(df_pred.set_index("Day"))
 
-            # ---------------------
-            # Individual Model Contributions
-            # ---------------------
-            st.subheader("Individual Model Predictions")
-            df_indiv = df_pred[["Day","Math","LSTM","FinBERT"]]
-            st.dataframe(df_indiv)
+            # Display individual model contributions
+            st.subheader("Individual Model Forecasts")
+            df_models = pd.DataFrame(individual)
+            st.dataframe(df_models)
 
-            # ---------------------
-            # Optional: Technical Indicators (last 90 days)
-            # ---------------------
-            st.subheader(f"{ticker} - Last 90 Days Technical Indicators")
-            if "Indicators" in df_pred.columns:
-                df_ind = pd.DataFrame(df_pred["Indicators"].tolist(), index=df_pred["Day"])
-                st.line_chart(df_ind)
-            else:
-                st.info("Technical indicators not available in Colab output.")
+            # Display crash risk
+            st.subheader(f"Crash Risk Probability (%) Next {FORECAST_DAYS} Days")
+            df_crash = pd.DataFrame({
+                "Day": np.arange(1, FORECAST_DAYS+1),
+                "Crash Risk %": [r*100 for r in crash_risk]
+            })
+            st.line_chart(df_crash.set_index("Day"))
 
-            # ---------------------
-            # Backtesting (optional)
-            # ---------------------
-            if "Backtest_RMSE" in df_pred.columns:
-                st.subheader("Walk-forward Backtesting")
-                st.metric(label="Historical RMSE", value=f"{df_pred['Backtest_RMSE'].iloc[0]:.2f}")
+# ---------------------
+# 90-Day Technical Indicator Chart
+# ---------------------
+st.subheader(f"{ticker} - Last 90 Days Technical Indicators & Candlesticks")
 
+try:
+    df_90 = yf.download(ticker, period="90d", interval="1d")
+    if not df_90.empty:
+        df_90["SMA20"] = df_90["Close"].rolling(20).mean()
+        df_90["BB_upper"] = df_90["SMA20"] + 2*df_90["Close"].rolling(20).std()
+        df_90["BB_lower"] = df_90["SMA20"] - 2*df_90["Close"].rolling(20).std()
+        rsi = RSIIndicator(df_90["Close"])
+        df_90["RSI"] = rsi.rsi()
+        macd = MACD(df_90["Close"])
+        df_90["MACD"] = macd.macd()
+        df_90["MACD_signal"] = macd.macd_signal()
+
+        df_plot = df_90.tail(90).copy()
+        fig = go.Figure()
+        fig.add_trace(go.Candlestick(
+            x=df_plot.index,
+            open=df_plot['Open'],
+            high=df_plot['High'],
+            low=df_plot['Low'],
+            close=df_plot['Close'],
+            name='Candlestick'
+        ))
+
+        indicator_lines = {
+            'SMA20': {'color':'orange'},
+            'BB_upper': {'color':'green', 'dash':'dash'},
+            'BB_lower': {'color':'red', 'dash':'dash'},
+            'RSI': {'color':'purple', 'yaxis':'y2'},
+            'MACD': {'color':'blue', 'yaxis':'y3'},
+            'MACD_signal': {'color':'red', 'dash':'dash', 'yaxis':'y3'}
+        }
+
+        for ind, opts in indicator_lines.items():
+            if ind in df_plot.columns:
+                line_props = dict(color=opts.get('color','black'))
+                if 'dash' in opts:
+                    line_props['dash'] = opts['dash']
+                fig.add_trace(go.Scatter(
+                    x=df_plot.index,
+                    y=df_plot[ind],
+                    mode='lines',
+                    name=ind,
+                    line=line_props,
+                    yaxis=opts.get('yaxis','y')
+                ))
+
+        fig.update_layout(
+            title=f"{ticker} - Last 90 Days Technical Chart",
+            xaxis=dict(title='Date'),
+            yaxis=dict(title='Price'),
+            yaxis2=dict(title='RSI', overlaying='y', side='right', range=[0,100]) if 'RSI' in df_plot.columns else None,
+            yaxis3=dict(title='MACD', overlaying='y', side='right', position=0.95) if 'MACD' in df_plot.columns else None,
+            legend=dict(orientation='h'),
+            height=600
+        )
+
+        st.plotly_chart(fig)
+    else:
+        st.warning(f"No recent data for {ticker}")
+except Exception as e:
+    st.error(f"Failed to generate chart: {e}")
