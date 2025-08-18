@@ -223,4 +223,4 @@ if run_button:
             st.table(fdf_math_rmse)
 
             st.subheader("Summary of Backtest RMSE")
-            st.table(df_summary
+            st.table(df_summary)
