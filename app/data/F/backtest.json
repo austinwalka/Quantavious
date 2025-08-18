@@ -1,0 +1,10 @@
+{
+  "math_rmse": {
+    "1": 0.3170480857416995,
+    "5": 0.6777318210982013,
+    "15": 1.1856649561384542,
+    "30": 1.6996707611512556
+  },
+  "lstm_rmse_1d": 3.0884186597600003,
+  "note": "Math RMSE uses GBM expected value proxy; LSTM RMSE is 1-step walk-forward with fixed model."
+}
