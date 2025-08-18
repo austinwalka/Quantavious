@@ -1,33 +1,35 @@
+# predict_pipeline.py
 import pandas as pd
-import yfinance as yf
-from ta.momentum import RSIIndicator
-from ta.trend import MACD, SMAIndicator
-from ta.volatility import BollingerBands
 import os
-import numpy as np
 from datetime import datetime, timedelta
 
-DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
+PREDICTIONS_DIR = "https://drive.google.com/drive/folders/14xT-hgxHFUwZDItzUm7nSFyZuVvW6Qqb?usp=drive_link"  # folder where Colab saves CSV/Parquet per stock
 
-def load_forecast(ticker):
-    """Load forecast CSV for a ticker"""
-    filepath = os.path.join(DATA_DIR, f"{ticker}_forecast.csv")
-    if os.path.exists(filepath):
-        return pd.read_csv(filepath)
+def load_stock_predictions(ticker: str):
+    """
+    Loads precomputed predictions for a ticker.
+    Returns:
+        df_pred: DataFrame with Day, Blended_Price, Crash_Risk, Math, LSTM, FinBERT
+        is_stale: bool, True if data is >1 day old
+    """
+    # normalize ticker for filename
+    file_safe_ticker = ticker.replace(".", "_").upper()
+    file_path_csv = os.path.join(PREDICTIONS_DIR, f"{file_safe_ticker}.csv")
+    file_path_parquet = os.path.join(PREDICTIONS_DIR, f"{file_safe_ticker}.parquet")
+
+    df_pred = None
+    if os.path.exists(file_path_parquet):
+        df_pred = pd.read_parquet(file_path_parquet)
+    elif os.path.exists(file_path_csv):
+        df_pred = pd.read_csv(file_path_csv)
     else:
-        return None
+        return None, False  # no data
 
-def download_last_90_days(ticker):
-    """Download last 90 days and compute technical indicators"""
-    df = yf.download(ticker, period="90d", interval="1d")
-    if df.empty:
-        return None
-    df["SMA20"] = SMAIndicator(df["Close"], window=20).sma_indicator()
-    df["RSI"] = RSIIndicator(df["Close"], window=14).rsi()
-    macd = MACD(df["Close"])
-    df["MACD"] = macd.macd()
-    df["MACD_signal"] = macd.macd_signal()
-    bb = BollingerBands(df["Close"], window=20, window_dev=2)
-    df["BB_upper"] = bb.bollinger_hband()
-    df["BB_lower"] = bb.bollinger_lband()
-    return df
+    # check freshness
+    if "Timestamp" in df_pred.columns:
+        last_updated = pd.to_datetime(df_pred["Timestamp"].max())
+        is_stale = last_updated < datetime.now() - timedelta(days=1)
+    else:
+        is_stale = True  # no timestamp means stale
+
+    return df_pred, is_stale

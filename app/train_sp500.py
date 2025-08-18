@@ -22,11 +22,10 @@
 #     - sentiment_daily.csv     (if FinBERT enabled)
 # ============================================================
 
-#Only commented out for vscode! Uncomment for colab
-#!pip -q install yfinance pandas numpy scipy scikit-learn ta arch plotly tqdm --upgrade
-#!pip -q install tensorflow --upgrade
+# !pip -q install yfinance pandas numpy scipy scikit-learn ta arch plotly tqdm --upgrade
+# !pip -q install tensorflow --upgrade
 # Optional sentiment (FinBERT); costs time & memory. Set ENABLE_FINBERT=False to skip.
-#!pip -q install transformers torch --upgrade
+# !pip -q install transformers torch --upgrade
 
 import os
 import io
@@ -68,7 +67,7 @@ os.makedirs(SAVE_DIR, exist_ok=True)
 
 START_DATE = "1990-01-01"
 LSTM_LOOKBACK = 1250
-LSTM_EPOCHS = 200            # adjust for quality/runtime
+LSTM_EPOCHS = 50            # adjust for quality/runtime
 LSTM_BATCH = 32
 FORECAST_DAYS = 30
 ROLL_WINDOW_EVT_DAYS = 756  # ~3 years for EVT threshold
@@ -76,7 +75,7 @@ ENABLE_GARCH = True         # set False if slow
 ENABLE_FINBERT = True       # set False to skip sentiment
 
 # S&P 500 batching controls (to avoid running all 500 at once)
-MAX_TICKERS_PER_RUN = 30   # change to run more/less
+MAX_TICKERS_PER_RUN = 500   # change to run more/less
 TICKER_OFFSET = 0          # skip first N tickers to continue batch work
 
 # Meta-blend weights
@@ -106,7 +105,7 @@ def get_sp500_tickers():
         table = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")
         df = table[0]
         tickers = df['Symbol'].tolist()
-        #tickers = ["NVDA"]  # start with 1 ticker
+        # tickers = ["NVDA"]  # start with 1 ticker
         tickers = [normalize_ticker(t) for t in tickers]
         return tickers
     except Exception as e:
@@ -129,33 +128,48 @@ def download_prices(ticker, start=START_DATE):
 # ===========================
 # Technical Indicators
 # ===========================
-def compute_technical_indicators(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
-    price = out['Close'].astype(float)
+def compute_technical_indicators(df):
+    """
+    Compute common technical indicators for a stock DataFrame.
+    Expects a DataFrame with at least 'Close' column.
+    Returns the original DataFrame with added indicator columns.
+    """
 
-    # Trend indicators
-    out['SMA20']  = price.rolling(20).mean()
-    out['EMA20']  = price.ewm(span=20, adjust=False).mean()
-    out['SMA50']  = price.rolling(50).mean()
-    out['EMA50']  = price.ewm(span=50, adjust=False).mean()
+    # Ensure 'Close' is a Series (1D)
+    close = df['Close'].copy().squeeze()
 
-    # Volatility indicators
-    out['BB_MIDDLE'] = ta.volatility.BollingerBands(price, window=20).bollinger_mavg()
-    out['BB_UPPER']  = ta.volatility.BollingerBands(price, window=20).bollinger_hband()
-    out['BB_LOWER']  = ta.volatility.BollingerBands(price, window=20).bollinger_lband()
+    # Simple Moving Averages
+    df['SMA_5'] = close.rolling(window=5).mean().squeeze()
+    df['SMA_10'] = close.rolling(window=10).mean().squeeze()
 
-    # Momentum indicators
-    out['RSI14'] = ta.momentum.RSIIndicator(price, window=14).rsi()
+    # Exponential Moving Averages
+    df['EMA_5'] = close.ewm(span=5, adjust=False).mean().squeeze()
+    df['EMA_10'] = close.ewm(span=10, adjust=False).mean().squeeze()
 
-    macd = ta.trend.MACD(price)
-    out['MACD']        = macd.macd()
-    out['MACD_SIGNAL'] = macd.macd_signal()
-    out['MACD_HIST']   = macd.macd_diff()
+    # Relative Strength Index (RSI)
+    delta = close.diff()
+    gain = delta.where(delta > 0, 0)
+    loss = -delta.where(delta < 0, 0)
 
-    out['RET'] = price.pct_change()
-    out['LOGRET'] = np.log(price).diff()
+    avg_gain = gain.rolling(window=14).mean()
+    avg_loss = loss.rolling(window=14).mean()
 
-    return out
+    rs = avg_gain / avg_loss
+    df['RSI_14'] = 100 - (100 / (1 + rs)).squeeze()
+
+    # MACD (12,26,9)
+    ema_12 = close.ewm(span=12, adjust=False).mean()
+    ema_26 = close.ewm(span=26, adjust=False).mean()
+    df['MACD'] = ema_12 - ema_26.squeeze()
+    df['MACD_signal'] = df['MACD'].ewm(span=9, adjust=False).mean().squeeze()
+
+    # Daily Returns
+    df['Return'] = close.pct_change().squeeze()
+
+    # Fill NaN values (optional, depending on model needs)
+    df.fillna(0, inplace=True)
+
+    return df
 
 # ===========================
 # Math Models (MC forecasts)
@@ -222,7 +236,7 @@ def math_forecasts(df: pd.DataFrame, days=30):
     """
     Produce math-based 30-day forecasts: GBM, OU, Vol Spreads.
     """
-    price = df['Close'].astype(float).values
+    price = df['Close'].astype(float).values.squeeze()
     logp  = np.log(price + 1e-9)
     S0 = float(price[-1])
 
@@ -413,7 +427,7 @@ def fetch_yf_news_daily_sentiment(ticker, days_back=60):
     meta = []
     for item in news:
         ts = item.get('providerPublishTime')
-        if ts is None: 
+        if ts is None:
             continue
         dt = datetime.utcfromtimestamp(int(ts))
         if dt < cutoff:
@@ -470,7 +484,7 @@ def backtest_math_only(df, horizon_list=[1,5,15,30]):
     For each day in last 252 days, estimate mu/sigma from prior 252 and
     compute 1-step ahead (or horizon) expected price using GBM mean.
     """
-    price = df['Close'].astype(float).values
+    price = df['Close'].astype(float).values.squeeze()
     logp  = np.log(price + 1e-9)
     N = len(price)
     H = max(horizon_list)
@@ -553,7 +567,7 @@ def run_ticker_pipeline(ticker):
         print("Insufficient data after indicators.")
         return
 
-    last_close = float(df['Close'].iloc[-1])
+    last_close = float(df['Close'].iloc[-1].squeeze())
 
     # Math forecasts (price paths)
     gbm_path, ou_path, vol_path = math_forecasts(df, days=FORECAST_DAYS)
@@ -581,7 +595,7 @@ def run_ticker_pipeline(ticker):
 
     # Blend price paths:
     # We'll convert each path to a % return relative to last_close, then blend
-    def to_ret(path): 
+    def to_ret(path):
         return (np.array(path) - last_close) / max(last_close,1e-6)
 
     r_gbm = to_ret(gbm_path)
