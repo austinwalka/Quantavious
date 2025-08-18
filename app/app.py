@@ -87,6 +87,7 @@ if run_button:
             df_forecast = data["forecast"]
             df_ind = data["indicators"]
             df_crash = data["crash"]
+            df_backtest = data["backtest"]
 
             fig = go.Figure()
 
@@ -207,5 +208,19 @@ if run_button:
 
             # --------- Backtest ---------
             st.subheader("Backtest Metrics")
-            for k,v in data["backtest"].items():
-                st.metric(label=k, value=v)
+            fdf_math_rmse = pd.DataFrame(list(df_backtest["math_rmse"].items()), columns=["Days", "RMSE"])
+            fdf_math_rmse["Days"] = fdf_math_rmse["Days"].astype(int)
+
+            # Create a summary table with LSTM RMSE
+            df_summary = pd.DataFrame({
+                "Model": ["Math Model", "LSTM 1-Day"],
+                "RMSE": [fdf_math_rmse["RMSE"].tolist(), df_backtest["lstm_rmse_1d"]],
+                "Description": [df_backtest["note"], "1-step walk-forward LSTM"]
+            })
+
+            # Display both
+            st.subheader("Math Model RMSE by Forecast Horizon")
+            st.table(fdf_math_rmse)
+
+            st.subheader("Summary of Backtest RMSE")
+            st.table(df_summary
