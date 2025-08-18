@@ -1,7 +1,0 @@
-[server]
-headless = true
-enableCORS = false
-# Don't set port here; Render injects $PORT and we pass it via start command.
-
-[browser]
-gatherUsageStats = false
