@@ -56,7 +56,7 @@ run_button = st.sidebar.button("Load Forecast")
 # -----------------------
 # Helper functions
 # -----------------------
-DATA_DIR = Path("./data")  # Change if needed
+DATA_DIR = Path("data")  # Change if needed
 
 def load_colab_data(ticker):
     stock_dir = DATA_DIR / ticker
