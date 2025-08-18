@@ -1,57 +1,43 @@
-# utils.py
 import os
+import json
 import pandas as pd
-import numpy as np
 
-from google.colab import drive
+DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 
-# ----------------------------
-# Drive Mount / Colab Access
-# ----------------------------
-def mount_drive():
-    """
-    Mount Google Drive to access pre-trained predictions.
-    Call this once at the top of your Colab.
-    """
-    try:
-        drive.mount('/content/drive')
-    except Exception as e:
-        print("Drive may already be mounted or access denied:", e)
+def get_stock_list():
+    """Return available tickers (folders inside data)."""
+    if not os.path.exists(DATA_DIR):
+        return []
+    return [d for d in os.listdir(DATA_DIR) if os.path.isdir(os.path.join(DATA_DIR, d))]
 
-# ----------------------------
-# Load Colab Predictions
-# ----------------------------
-def load_colab_predictions(ticker, folder_path="https://drive.google.com/drive/folders/14xT-hgxHFUwZDItzUm7nSFyZuVvW6Qqb?usp=sharing"):
-    """
-    Loads pre-trained predictions for a ticker.
-    Returns dict with:
-        - predictions: blended forecast (list)
-        - individual: dict of individual models
-        - crash_risk: list of 30-day crash probabilities
-    """
-    file_path = os.path.join(folder_path, f"{ticker}.pkl")
-    if not os.path.exists(file_path):
-        print(f"No pre-trained predictions found for {ticker}")
-        return None
+def load_forecast(ticker: str) -> pd.DataFrame:
+    path = os.path.join(DATA_DIR, ticker, "forecast_30d.csv")
+    if os.path.exists(path):
+        return pd.read_csv(path)
+    return pd.DataFrame()
 
-    try:
-        df = pd.read_pickle(file_path)
-        return {
-            "predictions": df["blended"].values.tolist(),
-            "individual": {k: v.tolist() for k, v in df["individual"].items()},
-            "crash_risk": df["crash_risk"].values.tolist()
-        }
-    except Exception as e:
-        print(f"Error loading predictions for {ticker}: {e}")
-        return None
+def load_crash(ticker: str) -> pd.DataFrame:
+    path = os.path.join(DATA_DIR, ticker, "crash_30d.csv")
+    if os.path.exists(path):
+        return pd.read_csv(path)
+    return pd.DataFrame()
 
-# ----------------------------
-# Backtesting / Metrics
-# ----------------------------
-def walk_forward_rmse(actual_prices, predicted_prices):
-    """
-    Simple RMSE walk-forward backtest
-    """
-    actual_prices = np.array(actual_prices)
-    predicted_prices = np.array(predicted_prices)
-    return np.sqrt(np.mean((actual_prices - predicted_prices) ** 2))
+def load_indicators(ticker: str) -> pd.DataFrame:
+    path = os.path.join(DATA_DIR, ticker, "indicators.csv")
+    if os.path.exists(path):
+        return pd.read_csv(path, parse_dates=["Date"])
+    return pd.DataFrame()
+
+def load_backtest(ticker: str) -> dict:
+    path = os.path.join(DATA_DIR, ticker, "backtest.json")
+    if os.path.exists(path):
+        with open(path, "r") as f:
+            return json.load(f)
+    return {}
+
+def load_meta(ticker: str) -> dict:
+    path = os.path.join(DATA_DIR, ticker, "meta.json")
+    if os.path.exists(path):
+        with open(path, "r") as f:
+            return json.load(f)
+    return {}
