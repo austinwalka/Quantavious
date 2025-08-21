@@ -28,7 +28,7 @@ logging.basicConfig(
 
 # Configuration
 START_DATE = "2015-01-01"
-END_DATE = datetime.now().strftime("%Y-%m-%d")  # August 20, 2025
+END_DATE = datetime.now().strftime("%Y-%m-%d")  # August 21, 2025
 FORECAST_HORIZON_DAYS = 30
 FORECAST_HORIZON_HOURS = 32
 LSTM_WINDOW_DAILY = 180
@@ -103,6 +103,9 @@ def get_sp500_tickers():
 
 def compute_indicators(df):
     try:
+        if df.empty or len(df) < 20:
+            logging.warning(f"Insufficient data for indicators: {len(df)} rows")
+            return None
         df_ind = df.copy()
         df_ind["RSI"] = ta.momentum.RSIIndicator(df["close"]).rsi()
         df_ind["MACD"] = ta.trend.MACD(df["close"]).macd()
@@ -116,7 +119,8 @@ def compute_indicators(df):
         df_ind["returns"] = df["close"].pct_change()
         df_ind["normal_growth_rate"] = df_ind["returns"].rolling(window=20).mean().iloc[-1] if len(df_ind) >= 20 else 0
         df_ind["current_growth_rate"] = df_ind["returns"].iloc[-1] if len(df_ind) >= 1 else 0
-        df_ind["volume_growth_signal"] = 1 if df_ind["current_growth_rate"] > df_ind["normal_growth_rate"] else 0
+        # Fix: Use scalar comparison for volume_growth_signal
+        df_ind["volume_growth_signal"] = 1 if df_ind["current_growth_rate"].iloc[-1] > df_ind["normal_growth_rate"].iloc[-1] else 0
         return df_ind.fillna(method="ffill").fillna(0)
     except Exception as e:
         logging.error(f"Error computing indicators: {e}")
@@ -298,7 +302,7 @@ def get_retail_institutional_metrics(symbol, start_date, end_date, timeframe="da
         df["inst_buy_pct"] = df["inst_buy_volume"] / df["inst_volume"].replace(0, np.nan)
         df["normal_growth_rate"] = df["retail_volume"].pct_change().rolling(window=20).mean().iloc[-1] if len(df) >= 20 else 0
         df["current_growth_rate"] = df["retail_volume"].pct_change().iloc[-1] if len(df) >= 1 else 0
-        df["volume_growth_signal"] = 1 if df["current_growth_rate"] > df["normal_growth_rate"] else 0
+        df["volume_growth_signal"] = 1 if df["current_growth_rate"].iloc[-1] > df["normal_growth_rate"].iloc[-1] else 0
         return df.fillna(method="ffill").fillna(0)
     except Exception as e:
         logging.error(f"Error getting retail/inst metrics for {symbol} ({timeframe}): {e}")
