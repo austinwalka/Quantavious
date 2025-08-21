@@ -1,0 +1,10 @@
+[server]
+runOnSave = true
+enableXsrfProtection = true
+port = 8501
+
+[browser]
+gatherUsageStats = true
+
+[logger]
+level = "info"
