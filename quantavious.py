@@ -2,6 +2,7 @@ import os
 import pandas as pd
 import numpy as np
 from polygon import RESTClient
+from datetime import datetime, timedelta
 import tensorflow as tf
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense, Dropout
@@ -32,7 +33,6 @@ LSTM_WINDOW_DAILY = 120
 LSTM_WINDOW_HOURLY = 240
 LSTM_EPOCHS = 20
 LSTM_BATCH_SIZE = 4
-TRADE_SAMPLE_DAYS = 30
 RETAIL_THRESHOLD = 1000  # Shares
 INSTITUTIONAL_THRESHOLD = 10000  # Shares
 TRADE_SAMPLE_DAYS = 7  # For trades/quotes
