@@ -1,4 +1,5 @@
 import os
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"  # Suppress TensorFlow warnings
 import pandas as pd
 import numpy as np
 from polygon import RESTClient
@@ -23,23 +24,25 @@ import multiprocessing
 from concurrent.futures import ProcessPoolExecutor
 from statsmodels.tsa.arima.model import ARIMA
 import time
+from sklearn.model_selection import GridSearchCV, TimeSeriesSplit
+from sklearn.metrics import mean_squared_error
 
 # Configuration
-START_DATE = "2015-01-01"
+START_DATE = "2010-01-01"  # 15 years for daily (yfinance)
 END_DATE = datetime.now().strftime("%Y-%m-%d")
 FORECAST_HORIZON_DAYS = 30
 FORECAST_HORIZON_HOURS = 32
 LSTM_WINDOW_DAILY = 120
 LSTM_WINDOW_HOURLY = 240
-LSTM_EPOCHS = 20
+LSTM_EPOCHS = 50  # Increased for GPU accuracy
 LSTM_BATCH_SIZE = 4
 RETAIL_THRESHOLD = 1000  # Shares
 INSTITUTIONAL_THRESHOLD = 10000  # Shares
-TRADE_SAMPLE_DAYS = 7  # For trades/quotes
-HOURLY_FETCH_DAYS = 30  # Extended for hourly data
-API_TIMEOUT = 60  # Seconds
-META_WEIGHTS = {"arima": 0.4, "lstm": 0.4, "volume": 0.2}
-TRAIN_YEARS = 10
+TRADE_SAMPLE_DAYS = 180  # Extended for retail/institutional
+HOURLY_FETCH_DAYS = 365  # 1 year for hourly (Polygon)
+API_TIMEOUT = 120  # For longer fetches
+META_WEIGHTS = {"arima": 0.3, "lstm": 0.5, "volume": 0.2}
+TRAIN_YEARS = 15  # Extended look-back
 DRIVE_SAVE_DIR = "/root/quantavious_results"
 ACCESS_KEY = "DO801BCYQYGPE2CXH697"
 SECRET_KEY = "virbY1dJdNa+BzEVxyPBZIC/mZRcntLxLqy0H6A8QVc"
@@ -47,7 +50,7 @@ SPACE_NAME = "quantavious-data"
 REGION = "nyc3"
 client = RESTClient(api_key="oKCzovWve0OCkMjgJzYX7pNhTFXqswDu")
 IS_COLAB = "google.colab" in sys.modules
-MAX_WORKERS = 1 if IS_COLAB else min(multiprocessing.cpu_count(), 32)
+MAX_WORKERS = 1 if IS_COLAB else min(multiprocessing.cpu_count(), 64)  # GPU parallelism
 
 # Logging setup
 logging.basicConfig(
@@ -63,10 +66,11 @@ s3_client = session.client('s3', region_name=REGION, endpoint_url=f"https://{REG
 
 def log_schedule():
     today = datetime.now().weekday()
-    if today < 5:
-        logging.info(f"Scheduled run for weekday: {datetime.now().strftime('%A, %Y-%m-%d %H:%M:%S %Z')}")
-    else:
-        logging.info(f"No run scheduled for weekend: {datetime.now().strftime('%A, %Y-%m-%d %H:%M:%S %Z')}")
+    if today == 6:  # Sunday for weekly runs
+        logging.info(f"Scheduled weekly run: {datetime.now().strftime('%A, %Y-%m-%d %H:%M:%S %Z')}")
+        return True
+    logging.info(f"No run scheduled: {datetime.now().strftime('%A, %Y-%m-%d %H:%M:%S %Z')}")
+    return False
 
 def upload_to_spaces(file_path, key):
     try:
@@ -99,12 +103,8 @@ def get_market_cap(ticker):
 def download_bars_polygon(ticker, start_date, end_date, timeframe="day"):
     try:
         start_time = time.time()
-        if timeframe == "day":
-            bars = client.get_aggs(ticker=ticker, multiplier=1, timespan="day",
-                                  from_=start_date, to=end_date, limit=50000)
-        else:
-            bars = client.get_aggs(ticker=ticker, multiplier=1, timespan="hour",
-                                  from_=start_date, to=end_date, limit=50000)
+        bars = client.get_aggs(ticker=ticker, multiplier=1, timespan=timeframe,
+                              from_=start_date, to=end_date, limit=50000)
         if time.time() - start_time > API_TIMEOUT:
             logging.warning(f"API timeout for {ticker} ({timeframe})")
             return None
@@ -119,16 +119,14 @@ def download_bars_polygon(ticker, start_date, end_date, timeframe="day"):
             return None
         return df
     except Exception as e:
-        logging.warning(f"Polygon failed for {ticker}, trying yfinance: {e}")
+        logging.warning(f"Polygon failed for {ticker} ({timeframe}): {e}")
         return download_ohlcv_yfinance(ticker, start_date, end_date, timeframe)
 
 def download_ohlcv_yfinance(ticker, start_date, end_date, timeframe="day"):
     try:
         stock = yf.Ticker(ticker)
-        if timeframe == "day":
-            df = stock.history(start=start_date, end=end_date, interval="1d")
-        else:
-            df = stock.history(start=start_date, end=end_date, interval="1h")
+        interval = "1d" if timeframe == "day" else "1h"
+        df = stock.history(start=start_date, end=end_date, interval=interval)
         df = df[["Open", "High", "Low", "Close", "Volume"]]
         df.columns = ["open", "high", "low", "close", "volume"]
         df.index.name = "timestamp"
@@ -316,6 +314,38 @@ def compute_indicators(df, timeframe="day"):
         logging.error(f"Indicator error: {e}")
         return None
 
+def compute_predicted_volume(df, forecast_horizon, window, timeframe="day"):
+    try:
+        scaler = StandardScaler()
+        scaled_data = scaler.fit_transform(df["volume"].values.reshape(-1, 1))
+        X, y = [], []
+        for i in range(len(scaled_data) - window - forecast_horizon):
+            X.append(scaled_data[i:i + window])
+            y.append(scaled_data[i + window:i + window + forecast_horizon])
+        if len(X) < 10:
+            logging.warning(f"Insufficient data for volume LSTM: {len(X)} samples")
+            return np.array([df["volume"].mean()] * forecast_horizon)
+        X, y = np.array(X), np.array(y)
+        model = Sequential([
+            LSTM(50, return_sequences=True, input_shape=(window, 1), kernel_regularizer=l2(0.01)),
+            Dropout(0.2),
+            LSTM(50, kernel_regularizer=l2(0.01)),
+            Dropout(0.2),
+            Dense(forecast_horizon)
+        ])
+        model.compile(optimizer="adam", loss="mse")
+        with tf.device('/GPU:0'):  # Explicit GPU placement
+            model.fit(X, y.reshape(len(y), -1), epochs=LSTM_EPOCHS, batch_size=LSTM_BATCH_SIZE, verbose=0,
+                      validation_split=0.2, callbacks=[EarlyStopping(patience=5)])
+        last_sequence = scaled_data[-window:].reshape(1, window, 1)
+        forecast_scaled = model.predict(last_sequence, verbose=0)[0]
+        forecast = scaler.inverse_transform(forecast_scaled.reshape(-1, 1)).flatten()
+        logging.info(f"Predicted volume for {timeframe}: min={min(forecast):.2f}, max={max(forecast):.2f}")
+        return forecast
+    except Exception as e:
+        logging.error(f"Volume LSTM error: {e}")
+        return np.array([df["volume"].mean()] * forecast_horizon)
+
 def compute_predicted_technicals(df, forecast_horizon, window, timeframe="day"):
     try:
         scaler = StandardScaler()
@@ -337,8 +367,9 @@ def compute_predicted_technicals(df, forecast_horizon, window, timeframe="day"):
             Dense(forecast_horizon * len(features))
         ])
         model.compile(optimizer="adam", loss="mse")
-        model.fit(X, y.reshape(len(y), -1), epochs=LSTM_EPOCHS, batch_size=LSTM_BATCH_SIZE, verbose=0,
-                  callbacks=[EarlyStopping(patience=5)])
+        with tf.device('/GPU:0'):  # Explicit GPU placement
+            model.fit(X, y.reshape(len(y), -1), epochs=LSTM_EPOCHS, batch_size=LSTM_BATCH_SIZE, verbose=0,
+                      validation_split=0.2, callbacks=[EarlyStopping(patience=5)])
         last_sequence = scaled_data[-window:].reshape(1, window, len(features))
         forecast_scaled = model.predict(last_sequence, verbose=0).reshape(forecast_horizon, len(features))
         forecast = scaler.inverse_transform(forecast_scaled)
@@ -359,39 +390,64 @@ def compute_arima_forecast(df, forecast_horizon, timeframe="day"):
 
 def compute_lstm_forecast(df, pred_technicals, forecast_horizon, window, timeframe="day"):
     try:
+        logging.info(f"Starting LSTM for {timeframe}")
         scaler = StandardScaler()
         features = ["close", "rsi", "sma_20", "macd", "atr", "volume"]
         scaled_data = scaler.fit_transform(df[features])
         X, y = [], []
         for i in range(len(scaled_data) - window - forecast_horizon):
             X.append(scaled_data[i:i + window])
-            y.append(scaled_data[i + window:i + window + forecast_horizon, 0])  # Predict 'close' only
+            y.append(scaled_data[i + window:i + window + forecast_horizon, 0])
         if len(X) < 10:
-            logging.warning(f"Insufficient data for LSTM training: {len(X)} samples")
+            logging.warning(f"Insufficient data for LSTM: {len(X)} samples")
             return np.array([df["close"].mean()] * forecast_horizon)
         X, y = np.array(X), np.array(y)
-        logging.info(f"LSTM training data shapes - X: {X.shape}, y: {y.shape}")
-        model = Sequential([
-            LSTM(50, return_sequences=True, input_shape=(window, len(features)), kernel_regularizer=l2(0.01)),
-            Dropout(0.2),
-            LSTM(50, kernel_regularizer=l2(0.01)),
-            Dropout(0.2),
-            Dense(forecast_horizon)  # Output exactly forecast_horizon values
-        ])
-        model.compile(optimizer="adam", loss="mse")
-        model.fit(X, y, epochs=LSTM_EPOCHS, batch_size=LSTM_BATCH_SIZE, verbose=0,
-                  callbacks=[EarlyStopping(patience=5)])
+        tscv = TimeSeriesSplit(n_splits=3)
+        param_grid = {'units': [50, 100], 'epochs': [20, 50]}
+        best_score, best_model = float("inf"), None
+        for units in param_grid['units']:
+            for epochs in param_grid['epochs']:
+                model = Sequential([
+                    LSTM(units, return_sequences=True, input_shape=(window, len(features)), kernel_regularizer=l2(0.01)),
+                    Dropout(0.2),
+                    LSTM(units, kernel_regularizer=l2(0.01)),
+                    Dropout(0.2),
+                    Dense(forecast_horizon)
+                ])
+                model.compile(optimizer="adam", loss="mse")
+                for train_idx, val_idx in tscv.split(X):
+                    X_train, X_val = X[train_idx], X[val_idx]
+                    y_train, y_val = y[train_idx], y[val_idx]
+                    with tf.device('/GPU:0'):  # Explicit GPU placement
+                        model.fit(X_train, y_train, epochs=epochs, batch_size=LSTM_BATCH_SIZE, verbose=0,
+                                  validation_data=(X_val, y_val), callbacks=[EarlyStopping(patience=5)])
+                    y_pred = model.predict(X_val, verbose=0)
+                    score = mean_squared_error(y_val, y_pred)
+                    if score < best_score:
+                        best_score, best_model = score, model
         last_sequence = scaled_data[-window:].reshape(1, window, len(features))
-        forecast_scaled = model.predict(last_sequence, verbose=0)  # Shape: (1, forecast_horizon)
-        forecast_scaled = forecast_scaled[0]  # Shape: (forecast_horizon,)
+        forecast_scaled = best_model.predict(last_sequence, verbose=0)[0]
         forecast_padded = np.zeros((forecast_horizon, len(features)))
-        forecast_padded[:, 0] = forecast_scaled  # Place forecast in 'close' column
-        forecast = scaler.inverse_transform(forecast_padded)[:, 0]  # Extract 'close' column
-        logging.info(f"LSTM forecast shape: {forecast.shape}")
+        forecast_padded[:, 0] = forecast_scaled
+        forecast = scaler.inverse_transform(forecast_padded)[:, 0]
+        logging.info(f"Completed LSTM for {timeframe}: min={min(forecast):.2f}, max={max(forecast):.2f}")
         return forecast
     except Exception as e:
         logging.error(f"LSTM error: {e}")
         return np.array([df["close"].mean()] * forecast_horizon)
+
+def blend_forecasts(arima_forecast, lstm_forecast, predicted_volume, avg_volume):
+    try:
+        meta_blended = META_WEIGHTS["arima"] * arima_forecast + META_WEIGHTS["lstm"] * lstm_forecast
+        volume_factor = predicted_volume / avg_volume
+        volume_factor = np.clip(volume_factor, 0.8, 1.2)  # Dampen/reinforce
+        meta_blended *= volume_factor
+        meta_blended = META_WEIGHTS["volume"] * meta_blended
+        logging.info(f"Blended forecast: min={min(meta_blended):.2f}, max={max(meta_blended):.2f}")
+        return meta_blended
+    except Exception as e:
+        logging.error(f"Blend error: {e}")
+        return (arima_forecast + lstm_forecast) / 2
 
 def backtest_forecast(df, forecast, timeframe="day"):
     try:
@@ -533,10 +589,10 @@ def compute_portfolio_aggregates(output_dir=DRIVE_SAVE_DIR, forecast_horizon=FOR
         return None
 
 def run_ticker(ticker, start_date, end_date, forecast_horizon, window, timeframe="day"):
-    logging.info(f"Starting run_ticker for {ticker} ({timeframe})")
     try:
         logging.info(f"Processing {ticker} ({timeframe})...")
-        df = download_bars_polygon(ticker, start_date, end_date, timeframe)
+        # Use yfinance for daily, Polygon for hourly
+        df = download_ohlcv_yfinance(ticker, start_date, end_date, timeframe) if timeframe == "day" else download_bars_polygon(ticker, start_date, end_date, timeframe)
         if df is None:
             logging.warning(f"Data download failed for {ticker}")
             forecast_df = pd.DataFrame({
@@ -547,8 +603,8 @@ def run_ticker(ticker, start_date, end_date, forecast_horizon, window, timeframe
             })
             retail_inst_df = pd.DataFrame({
                 "day": range(1, forecast_horizon + 1),
-                "retail_volume": [0.0] * forecast_horizon,
-                "inst_volume": [0.0] * forecast_horizon,
+                "retail_volume": [0] * forecast_horizon,
+                "inst_volume": [0] * forecast_horizon,
                 "retail_buy_pct": [50.0] * forecast_horizon,
                 "inst_buy_pct": [50.0] * forecast_horizon
             })
@@ -584,8 +640,8 @@ def run_ticker(ticker, start_date, end_date, forecast_horizon, window, timeframe
             })
             retail_inst_df = pd.DataFrame({
                 "day": range(1, forecast_horizon + 1),
-                "retail_volume": [0.0] * forecast_horizon,
-                "inst_volume": [0.0] * forecast_horizon,
+                "retail_volume": [0] * forecast_horizon,
+                "inst_volume": [0] * forecast_horizon,
                 "retail_buy_pct": [50.0] * forecast_horizon,
                 "inst_buy_pct": [50.0] * forecast_horizon
             })
@@ -613,6 +669,9 @@ def run_ticker(ticker, start_date, end_date, forecast_horizon, window, timeframe
         pred_technicals = compute_predicted_technicals(df_indicators, forecast_horizon, window, timeframe)
         arima_forecast = compute_arima_forecast(df_indicators, forecast_horizon, timeframe)
         lstm_forecast = compute_lstm_forecast(df_indicators, pred_technicals, forecast_horizon, window, timeframe)
+        predicted_volume = compute_predicted_volume(df_indicators, forecast_horizon, window, timeframe)
+        avg_volume = df_indicators["volume"].mean()
+        meta_blended = blend_forecasts(arima_forecast, lstm_forecast, predicted_volume, avg_volume)
         
         trade_start_date = (datetime.now() - timedelta(days=TRADE_SAMPLE_DAYS)).strftime("%Y-%m-%d")
         df_trades = download_trades_polygon(ticker, trade_start_date, end_date)
@@ -640,9 +699,7 @@ def run_ticker(ticker, start_date, end_date, forecast_horizon, window, timeframe
             "day": range(1, forecast_horizon + 1),
             "arima_mean": arima_forecast,
             "lstm_mean": lstm_forecast,
-            "meta_blended": META_WEIGHTS["arima"] * arima_forecast +
-                           META_WEIGHTS["lstm"] * lstm_forecast +
-                           META_WEIGHTS["volume"] * df_indicators["volume"].mean()
+            "meta_blended": meta_blended
         })
         retail_inst_df = pd.DataFrame({
             "day": range(1, forecast_horizon + 1),
@@ -652,7 +709,7 @@ def run_ticker(ticker, start_date, end_date, forecast_horizon, window, timeframe
             "inst_buy_pct": [inst_buy_pct] * forecast_horizon
         })
         technicals_df = pred_technicals
-        backtest_results = backtest_forecast(df_indicators, lstm_forecast, timeframe)
+        backtest_results = backtest_forecast(df_indicators, meta_blended, timeframe)
         
         base_dir = os.path.join(DRIVE_SAVE_DIR, ticker, timeframe)
         forecast_path = os.path.join(base_dir, f"forecast_{'5d_hourly' if timeframe == 'hour' else '30d'}.csv")
@@ -673,8 +730,8 @@ def run_ticker(ticker, start_date, end_date, forecast_horizon, window, timeframe
         
         return {"ticker": ticker, "status": "success", "error": ""}
     except Exception as e:
-        logging.error(f"run_ticker failed for {ticker} ({timeframe}): {e}")
-        return {"ticker": ticker, "status": "failed", "error": str(e)}    
+        logging.error(f"Error processing {ticker}: {e}")
+        return {"ticker": ticker, "status": "failed", "error": str(e)}
 
 def run_batch(tickers, start_date, end_date, forecast_horizon, window, timeframe="day"):
     try:
@@ -693,27 +750,23 @@ def run_batch(tickers, start_date, end_date, forecast_horizon, window, timeframe
         return [{"ticker": ticker, "status": "failed", "error": str(e)} for ticker in tickers]
 
 def main(argv=None):
-    logging.info("Script started")
-    try:
-        parser = argparse.ArgumentParser(description="Quantavious stock forecasting")
-        parser.add_argument("--tickers", type=str, default="AAPL", help="Comma-separated list of tickers")
-        args, _ = parser.parse_known_args(argv)
-        # ... existing code ...
-        logging.info("Script completed successfully")
-    except Exception as e:
-        logging.error(f"Script failed: {e}")
-        raise
-    
     parser = argparse.ArgumentParser(description="Quantavious stock forecasting")
     parser.add_argument("--tickers", type=str, default="AAPL", help="Comma-separated list of tickers (e.g., AAPL)")
     args, _ = parser.parse_known_args(argv)
 
-    log_schedule()
-    os.makedirs(DRIVE_SAVE_DIR, exist_ok=True)
-    if datetime.now().weekday() >= 5 and not IS_COLAB:
-        logging.info("Exiting: No run on weekends")
+    if not log_schedule() and not IS_COLAB:
+        logging.info("Exiting: No run on non-Sunday")
         return
 
+    # Check GPU availability
+    gpus = tf.config.list_physical_devices('GPU')
+    logging.info(f"GPUs detected: {len(gpus)}")
+    if gpus:
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+            logging.info(f"Using GPU: {gpu.name}")
+
+    os.makedirs(DRIVE_SAVE_DIR, exist_ok=True)
     TICKERS = args.tickers.split(",")
     if not TICKERS:
         logging.error("No tickers provided. Exiting.")
@@ -741,11 +794,6 @@ def main(argv=None):
         logging.info(f"Run summary saved to {summary_path}")
     except Exception as e:
         logging.error(f"Error saving run summary: {e}")
-
-        logging.info("Script completed successfully")
-    except Exception as e:
-        logging.error(f"Script failed: {e}")
-        raise
 
 if __name__ == "__main__":
     warnings.filterwarnings("ignore")
