@@ -533,6 +533,7 @@ def compute_portfolio_aggregates(output_dir=DRIVE_SAVE_DIR, forecast_horizon=FOR
         return None
 
 def run_ticker(ticker, start_date, end_date, forecast_horizon, window, timeframe="day"):
+    logging.info(f"Starting run_ticker for {ticker} ({timeframe})")
     try:
         logging.info(f"Processing {ticker} ({timeframe})...")
         df = download_bars_polygon(ticker, start_date, end_date, timeframe)
@@ -672,8 +673,8 @@ def run_ticker(ticker, start_date, end_date, forecast_horizon, window, timeframe
         
         return {"ticker": ticker, "status": "success", "error": ""}
     except Exception as e:
-        logging.error(f"Error processing {ticker}: {e}")
-        return {"ticker": ticker, "status": "failed", "error": str(e)}
+        logging.error(f"run_ticker failed for {ticker} ({timeframe}): {e}")
+        return {"ticker": ticker, "status": "failed", "error": str(e)}    
 
 def run_batch(tickers, start_date, end_date, forecast_horizon, window, timeframe="day"):
     try:
@@ -692,6 +693,17 @@ def run_batch(tickers, start_date, end_date, forecast_horizon, window, timeframe
         return [{"ticker": ticker, "status": "failed", "error": str(e)} for ticker in tickers]
 
 def main(argv=None):
+    logging.info("Script started")
+    try:
+        parser = argparse.ArgumentParser(description="Quantavious stock forecasting")
+        parser.add_argument("--tickers", type=str, default="AAPL", help="Comma-separated list of tickers")
+        args, _ = parser.parse_known_args(argv)
+        # ... existing code ...
+        logging.info("Script completed successfully")
+    except Exception as e:
+        logging.error(f"Script failed: {e}")
+        raise
+    
     parser = argparse.ArgumentParser(description="Quantavious stock forecasting")
     parser.add_argument("--tickers", type=str, default="AAPL", help="Comma-separated list of tickers (e.g., AAPL)")
     args, _ = parser.parse_known_args(argv)
@@ -729,6 +741,11 @@ def main(argv=None):
         logging.info(f"Run summary saved to {summary_path}")
     except Exception as e:
         logging.error(f"Error saving run summary: {e}")
+
+        logging.info("Script completed successfully")
+    except Exception as e:
+        logging.error(f"Script failed: {e}")
+        raise
 
 if __name__ == "__main__":
     warnings.filterwarnings("ignore")
