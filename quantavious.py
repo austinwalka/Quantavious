@@ -2,15 +2,13 @@ import os
 import pandas as pd
 import numpy as np
 from polygon import RESTClient
-from datetime import datetime, timedelta, time
 import tensorflow as tf
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense, Dropout
+from tensorflow.keras.regularizers import l2
+from tensorflow.keras.callbacks import EarlyStopping
 from sklearn.preprocessing import StandardScaler
-import multiprocessing
-from concurrent.futures import ProcessPoolExecutor
-from hmmlearn.hmm import GaussianHMM
-from arch import arch_model
+from sklearn.cluster import DBSCAN
 import yfinance as yf
 import ta
 import warnings
@@ -19,45 +17,56 @@ import boto3
 from boto3.session import Session
 import logging
 import argparse
+import sys
+import multiprocessing
+from concurrent.futures import ProcessPoolExecutor
+from statsmodels.tsa.arima.model import ARIMA
+import time
 
-# Disable GPU to avoid CUDA issues
-os.environ["CUDA_VISIBLE_DEVICES"] = ""
+# Configuration
+START_DATE = "2015-01-01"
+END_DATE = datetime.now().strftime("%Y-%m-%d")
+FORECAST_HORIZON_DAYS = 30
+FORECAST_HORIZON_HOURS = 32
+LSTM_WINDOW_DAILY = 120
+LSTM_WINDOW_HOURLY = 240
+LSTM_EPOCHS = 20
+LSTM_BATCH_SIZE = 4
+TRADE_SAMPLE_DAYS = 30
+RETAIL_THRESHOLD = 1000  # Shares
+INSTITUTIONAL_THRESHOLD = 10000  # Shares
+TRADE_SAMPLE_DAYS = 7  # For trades/quotes
+HOURLY_FETCH_DAYS = 30  # Extended for hourly data
+API_TIMEOUT = 60  # Seconds
+META_WEIGHTS = {"arima": 0.4, "lstm": 0.4, "volume": 0.2}
+TRAIN_YEARS = 10
+DRIVE_SAVE_DIR = "/root/quantavious_results"
+ACCESS_KEY = "DO801BCYQYGPE2CXH697"
+SECRET_KEY = "virbY1dJdNa+BzEVxyPBZIC/mZRcntLxLqy0H6A8QVc"
+SPACE_NAME = "quantavious-data"
+REGION = "nyc3"
+client = RESTClient(api_key="oKCzovWve0OCkMjgJzYX7pNhTFXqswDu")
+IS_COLAB = "google.colab" in sys.modules
+MAX_WORKERS = 1 if IS_COLAB else min(multiprocessing.cpu_count(), 32)
 
 # Logging setup
 logging.basicConfig(
-    filename="/root/quantavious.log",
+    filename="/root/quantavious.log" if not IS_COLAB else "/content/quantavious.log",
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s"
 )
 
-# Configuration
-START_DATE = "2015-01-01"  # 10 years to capture earnings cycles
-END_DATE = datetime.now().strftime("%Y-%m-%d")  # August 21, 2025
-FORECAST_HORIZON_DAYS = 30
-FORECAST_HORIZON_HOURS = 32  # ~5 days * 6.5 hours
-LSTM_WINDOW_DAILY = 120  # Reduced to ensure sufficient data
-LSTM_WINDOW_HOURLY = 240  # ~40 days * 6 hours
-LSTM_EPOCHS = 20
-LSTM_BATCH_SIZE = 4
-RETAIL_THRESHOLD = 1000
-INSTITUTIONAL_THRESHOLD = 10000
-TRADE_SAMPLE_DAYS = 30
-TRADE_SAMPLE_HOURS = 60
-META_WEIGHTS = {"math": 0.4, "lstm": 0.4, "volume": 0.2}
-TRAIN_YEARS = 10
-DRIVE_SAVE_DIR = "/root/quantavious_results"
-ACCESS_KEY = "DO801BCYQYGPE2CXH697"  # Replace
-SECRET_KEY = "virbY1dJdNa+BzEVxyPBZIC/mZRcntLxLqy0H6A8QVc"  # Replace
-SPACE_NAME = "quantavious-data"
-REGION = "nyc3"
-client = RESTClient(api_key="oKCzovWve0OCkMjgJzYX7pNhTFXqswDu")  # Replace
-MAX_WORKERS = min(multiprocessing.cpu_count(), 32)
-BATCH_SIZE = MAX_WORKERS
-
-# Initialize S3 client for Spaces
+# Initialize S3 client
 session = Session()
 s3_client = session.client('s3', region_name=REGION, endpoint_url=f"https://{REGION}.digitaloceanspaces.com",
                           aws_access_key_id=ACCESS_KEY, aws_secret_access_key=SECRET_KEY)
+
+def log_schedule():
+    today = datetime.now().weekday()
+    if today < 5:
+        logging.info(f"Scheduled run for weekday: {datetime.now().strftime('%A, %Y-%m-%d %H:%M:%S %Z')}")
+    else:
+        logging.info(f"No run scheduled for weekend: {datetime.now().strftime('%A, %Y-%m-%d %H:%M:%S %Z')}")
 
 def upload_to_spaces(file_path, key):
     try:
@@ -75,316 +84,334 @@ def safe_save(df, path):
     except Exception as e:
         logging.error(f"Error saving {path}: {e}")
 
-def download_bars_polygon(symbol, start_date, end_date, timeframe="day"):
+def get_market_cap(ticker):
     try:
+        stock = yf.Ticker(ticker)
+        market_cap = stock.info.get("marketCap", None)
+        if market_cap is None or market_cap <= 0:
+            logging.warning(f"No valid market cap for {ticker}, using default")
+            return 1e9  # Default 1B
+        return market_cap
+    except Exception as e:
+        logging.error(f"Error fetching market cap for {ticker}: {e}")
+        return 1e9
+
+def download_bars_polygon(ticker, start_date, end_date, timeframe="day"):
+    try:
+        start_time = time.time()
         if timeframe == "day":
-            bars = client.get_aggs(ticker=symbol, multiplier=1, timespan="day", from_=start_date, to=end_date, limit=5000)
+            bars = client.get_aggs(ticker=ticker, multiplier=1, timespan="day",
+                                  from_=start_date, to=end_date, limit=50000)
         else:
-            bars = client.get_aggs(ticker=symbol, multiplier=1, timespan="hour", from_=start_date, to=end_date, limit=5000)
-        df = pd.DataFrame([{
-            "timestamp": datetime.fromtimestamp(bar.timestamp / 1000),
-            "open": bar.open,
-            "high": bar.high,
-            "low": bar.low,
-            "close": bar.close,
-            "volume": bar.volume
-        } for bar in bars])
-        df["timestamp"] = pd.to_datetime(df["timestamp"]).dt.tz_localize("UTC").dt.tz_convert("US/Eastern")
-        if timeframe == "hour":
-            df = df[df["timestamp"].dt.time.between(time(9, 30), time(16, 0))]
-        return df.sort_values("timestamp")
-    except Exception as e:
-        logging.error(f"Error downloading {symbol} ({timeframe}): {e}")
-        return None
-
-def download_ohlcv_yfinance(ticker, start, end):
-    try:
-        df = yf.download(ticker, start=start, end=end, progress=False)
-        df = df.reset_index()
-        df['timestamp'] = pd.to_datetime(df['Date'], utc=True).dt.tz_convert("US/Eastern")
-        df = df.rename(columns={'Open': 'open', 'High': 'high', 'Low': 'low', 'Close': 'close', 'Volume': 'volume'})
-        return df[['timestamp', 'open', 'high', 'low', 'close', 'volume']].sort_values("timestamp")
-    except Exception as e:
-        logging.error(f"yfinance fetch failed for {ticker}: {e}")
-        return None
-
-def compute_indicators(df):
-    try:
-        if df.empty or len(df) < 20:
-            logging.warning(f"Insufficient data for indicators: {len(df)} rows")
+            bars = client.get_aggs(ticker=ticker, multiplier=1, timespan="hour",
+                                  from_=start_date, to=end_date, limit=50000)
+        if time.time() - start_time > API_TIMEOUT:
+            logging.warning(f"API timeout for {ticker} ({timeframe})")
             return None
-        df_ind = df.copy()
-        df_ind["returns"] = df_ind["close"].pct_change()
-        df_ind["amount_change"] = df_ind["close"] - df_ind["open"]
-        df_ind["pct_change"] = df_ind["amount_change"] / df_ind["open"]
-        df_ind["direction"] = df_ind["pct_change"].apply(lambda x: 1 if x > 0 else -1 if x < 0 else 0)
-        df_ind["mean_price"] = (df_ind["high"] + df_ind["low"] + df_ind["close"]) / 3
-        df_ind["RSI"] = ta.momentum.RSIIndicator(df_ind["close"]).rsi()
-        df_ind["MACD"] = ta.trend.MACD(df_ind["close"]).macd()
-        df_ind["MACD_signal"] = ta.trend.MACD(df_ind["close"]).macd_signal()
-        df_ind["SMA20"] = ta.trend.SMAIndicator(df_ind["close"], window=20).sma_indicator()
-        df_ind["BB_upper"], df_ind["BB_lower"] = ta.volatility.BollingerBands(df_ind["close"]).bollinger_hband(), ta.volatility.BollingerBands(df_ind["close"]).bollinger_lband()
-        df_ind["ATR"] = ta.volatility.AverageTrueRange(df_ind["high"], df_ind["low"], df_ind["close"]).average_true_range()
-        df_ind["VWAP"] = ta.volume.VolumeWeightedAveragePrice(df_ind["high"], df_ind["low"], df_ind["close"], df_ind["volume"]).volume_weighted_average_price()
-        df_ind["vol_momentum"] = df_ind["volume"].pct_change().rolling(window=10).mean()
-        df_ind["vol_zscore"] = (df_ind["volume"] - df_ind["volume"].rolling(window=20).mean()) / df_ind["volume"].rolling(window=20).std()
-        df_ind["normal_growth_rate"] = df_ind["returns"].rolling(window=20).mean().iloc[-1] if len(df_ind) >= 20 else 0
-        df_ind["current_growth_rate"] = df_ind["returns"].iloc[-1] if len(df_ind) >= 1 else 0
-        df_ind["volume_growth_signal"] = 1 if df_ind["current_growth_rate"] > df_ind["normal_growth_rate"] else 0
-        return df_ind.fillna(method="ffill").fillna(0)
+        data = [{"timestamp": b.timestamp, "open": b.open, "high": b.high,
+                 "low": b.low, "close": b.close, "volume": b.volume} for b in bars]
+        df = pd.DataFrame(data)
+        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+        df.set_index("timestamp", inplace=True)
+        logging.info(f"Fetched {len(df)} {timeframe} bars for {ticker}")
+        if len(df) < (LSTM_WINDOW_DAILY if timeframe == "day" else LSTM_WINDOW_HOURLY):
+            logging.warning(f"Insufficient data for {ticker}: {len(df)}")
+            return None
+        return df
     except Exception as e:
-        logging.error(f"Error computing indicators: {e}")
+        logging.warning(f"Polygon failed for {ticker}, trying yfinance: {e}")
+        return download_ohlcv_yfinance(ticker, start_date, end_date, timeframe)
+
+def download_ohlcv_yfinance(ticker, start_date, end_date, timeframe="day"):
+    try:
+        stock = yf.Ticker(ticker)
+        if timeframe == "day":
+            df = stock.history(start=start_date, end=end_date, interval="1d")
+        else:
+            df = stock.history(start=start_date, end=end_date, interval="1h")
+        df = df[["Open", "High", "Low", "Close", "Volume"]]
+        df.columns = ["open", "high", "low", "close", "volume"]
+        df.index.name = "timestamp"
+        logging.info(f"Fetched {len(df)} {timeframe} bars for {ticker} via yfinance")
+        if len(df) < (LSTM_WINDOW_DAILY if timeframe == "day" else LSTM_WINDOW_HOURLY):
+            logging.warning(f"Insufficient data for {ticker}: {len(df)}")
+            return None
+        return df
+    except Exception as e:
+        logging.error(f"yfinance failed for {ticker}: {e}")
         return None
 
-def train_lstm_model(data, window, forecast_horizon):
+def download_trades_polygon(ticker, start_date, end_date):
     try:
-        features = ["returns", "mean_price", "high", "low", "amount_change", "open", "close", "pct_change", "direction"]
-        data_features = data[features].dropna()
-        if len(data_features) < window + forecast_horizon + 10:
-            logging.warning(f"Insufficient data for LSTM training: {len(data_features)} rows")
-            return None, None, None
+        start_date = datetime.strptime(start_date, "%Y-%m-%d")
+        end_date = datetime.strptime(end_date, "%Y-%m-%d")
+        trades = []
+        current_date = start_date
+        start_time = time.time()
+        while current_date <= end_date:
+            trade_list = client.list_trades(
+                ticker=ticker,
+                timestamp_gte=int(current_date.timestamp() * 1_000_000_000),
+                timestamp_lte=int((current_date + timedelta(days=1)).timestamp() * 1_000_000_000),
+                limit=10000
+            )
+            for trade in trade_list:
+                trades.append({
+                    "timestamp": trade.sip_timestamp,
+                    "price": trade.price,
+                    "size": trade.size,
+                    "exchange": trade.exchange
+                })
+            current_date += timedelta(days=1)
+            if time.time() - start_time > API_TIMEOUT:
+                logging.warning(f"Trade data timeout for {ticker}")
+                return None
+        df = pd.DataFrame(trades)
+        if df.empty:
+            logging.warning(f"No trade data for {ticker}")
+            return None
+        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ns")
+        df.set_index("timestamp", inplace=True)
+        return df
+    except Exception as e:
+        logging.error(f"Polygon trades failed for {ticker}: {e}")
+        return None
+
+def download_quotes_polygon(ticker, start_date, end_date):
+    try:
+        start_date = datetime.strptime(start_date, "%Y-%m-%d")
+        end_date = datetime.strptime(end_date, "%Y-%m-%d")
+        quotes = []
+        current_date = start_date
+        start_time = time.time()
+        while current_date <= end_date:
+            quote_list = client.list_quotes(
+                ticker=ticker,
+                timestamp_gte=int(current_date.timestamp() * 1_000_000_000),
+                timestamp_lte=int((current_date + timedelta(days=1)).timestamp() * 1_000_000_000),
+                limit=50000
+            )
+            for quote in quote_list:
+                quotes.append({
+                    "timestamp": quote.sip_timestamp,
+                    "bid_price": quote.bid_price,
+                    "ask_price": quote.ask_price,
+                    "bid_size": quote.bid_size,
+                    "ask_size": quote.ask_size
+                })
+            current_date += timedelta(days=1)
+            if time.time() - start_time > API_TIMEOUT:
+                logging.warning(f"Quote data timeout for {ticker}")
+                return None
+        df = pd.DataFrame(quotes)
+        if df.empty:
+            logging.warning(f"No quote data for {ticker}")
+            return None
+        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ns")
+        df.set_index("timestamp", inplace=True)
+        logging.info(f"Fetched {len(df)} quotes for {ticker}")
+        return df
+    except Exception as e:
+        logging.error(f"Polygon quotes failed for {ticker}: {e}")
+        return None
+
+def detect_split_orders(df_trades):
+    try:
+        df_trades["timestamp_sec"] = df_trades.index.astype(int) / 1e9
+        features = df_trades[["timestamp_sec", "price", "size"]].values
         scaler = StandardScaler()
-        scaled_data = scaler.fit_transform(data_features)
+        scaled_features = scaler.fit_transform(features)
+        dbscan = DBSCAN(eps=0.5, min_samples=3)
+        df_trades["split_cluster"] = dbscan.fit_predict(scaled_features)
+        for cluster in df_trades["split_cluster"].unique():
+            if cluster == -1:
+                continue
+            cluster_trades = df_trades[df_trades["split_cluster"] == cluster]
+            total_size = cluster_trades["size"].sum()
+            if total_size > INSTITUTIONAL_THRESHOLD:
+                df_trades.loc[cluster_trades.index, "is_institutional"] = True
+                df_trades.loc[cluster_trades.index, "is_retail"] = False
+        return df_trades.drop(columns=["timestamp_sec"])
+    except Exception as e:
+        logging.error(f"Split order detection error: {e}")
+        return df_trades
+
+def classify_trades(df_trades, df_quotes=None, df_bars=None):
+    try:
+        df_trades["is_retail"] = df_trades["size"] <= RETAIL_THRESHOLD
+        df_trades["is_institutional"] = df_trades["size"] > INSTITUTIONAL_THRESHOLD
+        df_trades["is_buy"] = np.nan
+        classified_count = 0
+        total_trades = len(df_trades)
+        if df_quotes is not None and not df_quotes.empty:
+            df_quotes = df_quotes.sort_index()
+            df_trades = df_trades.sort_index()
+            df_trades = df_trades.reset_index()
+            df_quotes = df_quotes.reset_index()
+            df_merged = pd.merge_asof(
+                df_trades,
+                df_quotes,
+                on="timestamp",
+                tolerance=pd.Timedelta("1s"),
+                direction="backward"
+            )
+            df_merged.set_index("timestamp", inplace=True)
+            for idx, row in df_merged.iterrows():
+                if pd.notnull(row["bid_price"]) and pd.notnull(row["ask_price"]):
+                    bid = row["bid_price"]
+                    ask = row["ask_price"]
+                    price = row["price"]
+                    if price > (bid + ask) / 2:
+                        df_merged.at[idx, "is_buy"] = True
+                    elif price < (bid + ask) / 2:
+                        df_merged.at[idx, "is_buy"] = False
+                    classified_count += 1
+            df_trades = df_merged[["timestamp", "price", "size", "exchange", "is_retail", "is_institutional", "is_buy"]]
+            df_trades.set_index("timestamp", inplace=True)
+        if df_bars is not None and not df_bars.empty and df_trades["is_buy"].isna().any():
+            df_bars = df_bars.sort_index()
+            df_trades = df_trades.reset_index()
+            df_bars = df_bars.reset_index()
+            df_merged = pd.merge_asof(
+                df_trades,
+                df_bars[["timestamp", "close"]],
+                on="timestamp",
+                tolerance=pd.Timedelta("1h"),
+                direction="backward"
+            )
+            df_merged.set_index("timestamp", inplace=True)
+            for idx, row in df_merged[df_merged["is_buy"].isna()].iterrows():
+                if pd.notnull(row["close"]):
+                    prev_close = row["close"]
+                    price = row["price"]
+                    if price > prev_close:
+                        df_merged.at[idx, "is_buy"] = True
+                    elif price < prev_close:
+                        df_merged.at[idx, "is_buy"] = False
+                    classified_count += 1
+            df_trades = df_merged[["timestamp", "price", "size", "exchange", "is_retail", "is_institutional", "is_buy"]]
+            df_trades.set_index("timestamp", inplace=True)
+        df_trades["is_buy"] = df_trades["is_buy"].fillna(True)  # Conservative default
+        df_trades = detect_split_orders(df_trades)
+        logging.info(f"Classified {classified_count}/{total_trades} trades for buy/sell")
+        return df_trades
+    except Exception as e:
+        logging.error(f"Trade classification error: {e}")
+        return None
+
+def compute_indicators(df, timeframe="day"):
+    try:
+        df["returns"] = df["close"].pct_change()
+        df["rsi"] = ta.momentum.RSIIndicator(df["close"], window=14).rsi()
+        df["sma_20"] = ta.trend.SMAIndicator(df["close"], window=20).sma_indicator()
+        df["macd"] = ta.trend.MACD(df["close"]).macd()
+        df["atr"] = ta.volatility.AverageTrueRange(df["high"], df["low"], df["close"], window=14).average_true_range()
+        df["volume"] = df["volume"]
+        df.dropna(inplace=True)
+        if len(df) < (LSTM_WINDOW_DAILY if timeframe == "day" else LSTM_WINDOW_HOURLY):
+            logging.warning(f"Insufficient data after indicators for {timeframe}: {len(df)}")
+            return None
+        return df
+    except Exception as e:
+        logging.error(f"Indicator error: {e}")
+        return None
+
+def compute_predicted_technicals(df, forecast_horizon, window, timeframe="day"):
+    try:
+        scaler = StandardScaler()
+        features = ["rsi", "sma_20", "macd", "atr"]
+        scaled_data = scaler.fit_transform(df[features])
         X, y = [], []
         for i in range(len(scaled_data) - window - forecast_horizon):
             X.append(scaled_data[i:i + window])
-            y.append(scaled_data[i + window:i + window + forecast_horizon, 0])  # Predict returns
-        X, y = np.array(X), np.array(y)
+            y.append(scaled_data[i + window:i + window + forecast_horizon])
         if len(X) < 10:
-            logging.warning(f"Too few samples for LSTM: X={len(X)}")
-            return None, None, None
+            logging.warning(f"Insufficient data for technicals LSTM: {len(X)} samples")
+            return pd.DataFrame({f"pred_{f}": [df[f].mean()] * forecast_horizon for f in features}, index=range(1, forecast_horizon + 1))
+        X, y = np.array(X), np.array(y)
         model = Sequential([
-            LSTM(50, return_sequences=True, input_shape=(window, len(features))),
+            LSTM(50, return_sequences=True, input_shape=(window, len(features)), kernel_regularizer=l2(0.01)),
             Dropout(0.2),
-            LSTM(50),
+            LSTM(50, kernel_regularizer=l2(0.01)),
             Dropout(0.2),
-            Dense(forecast_horizon)
+            Dense(forecast_horizon * len(features))
         ])
         model.compile(optimizer="adam", loss="mse")
-        model.fit(X, y, epochs=LSTM_EPOCHS, batch_size=LSTM_BATCH_SIZE, verbose=0)
-        return model, scaler, scaled_data
+        model.fit(X, y.reshape(len(y), -1), epochs=LSTM_EPOCHS, batch_size=LSTM_BATCH_SIZE, verbose=0,
+                  callbacks=[EarlyStopping(patience=5)])
+        last_sequence = scaled_data[-window:].reshape(1, window, len(features))
+        forecast_scaled = model.predict(last_sequence, verbose=0).reshape(forecast_horizon, len(features))
+        forecast = scaler.inverse_transform(forecast_scaled)
+        return pd.DataFrame({f"pred_{f}": forecast[:, i] for i, f in enumerate(features)}, index=range(1, forecast_horizon + 1))
     except Exception as e:
-        logging.error(f"Error training LSTM model: {e}")
-        return None, None, None
+        logging.error(f"Technicals LSTM error: {e}")
+        return pd.DataFrame({f"pred_{f}": [df[f].mean()] * forecast_horizon for f in features}, index=range(1, forecast_horizon + 1))
 
-def forecast_lstm(model, scaler, scaled_data, window, forecast_horizon, S0):
+def compute_arima_forecast(df, forecast_horizon, timeframe="day"):
     try:
-        last_window = scaled_data[-window:].reshape(1, window, scaled_data.shape[1])
-        pred_scaled = model.predict(last_window, verbose=0)[0]  # Predicted returns
-        prices = [S0]
-        for ret in pred_scaled:
-            prices.append(prices[-1] * (1 + ret))  # Cumulative price
-        return np.array(prices[1:])
+        model = ARIMA(df["close"], order=(5, 1, 0))
+        model_fit = model.fit()
+        forecast = model_fit.forecast(steps=forecast_horizon)
+        return forecast.values
     except Exception as e:
-        logging.error(f"Error forecasting LSTM: {e}")
-        return np.array([S0] * forecast_horizon)
+        logging.error(f"ARIMA error: {e}")
+        return np.array([df["close"].mean()] * forecast_horizon)
 
-def train_hmm(data, n_components=3):
+def compute_lstm_forecast(df, pred_technicals, forecast_horizon, window, timeframe="day"):
     try:
-        returns = data["returns"].dropna().values
-        if len(returns) < 10:
-            logging.warning(f"Insufficient returns data for HMM: {len(returns)}")
-            return None
-        model = GaussianHMM(n_components=n_components, covariance_type="full", n_iter=2000, tol=1e-6)
-        model.fit(returns.reshape(-1, 1))
-        return model
-    except Exception as e:
-        logging.error(f"Error training HMM: {e}")
-        return None
-
-def forecast_hmm(model, data, forecast_horizon, S0):
-    try:
-        if model is None:
-            return np.array([S0] * forecast_horizon)
-        returns = data["returns"].dropna().values
-        if len(returns) < 1:
-            return np.array([S0] * forecast_horizon)
-        last_state = model.predict(returns.reshape(-1, 1))[-1]
-        sim_returns = model.sample(forecast_horizon)[0].flatten()
-        prices = [S0]
-        for ret in sim_returns:
-            prices.append(prices[-1] * (1 + ret))
-        return np.array(prices[1:])
-    except Exception as e:
-        logging.error(f"Error forecasting HMM: {e}")
-        return np.array([S0] * forecast_horizon)
-
-def train_garch(data):
-    try:
-        returns = data["returns"].dropna() * 100
-        if len(returns) < 10:
-            logging.warning(f"Insufficient returns data for GARCH: {len(returns)}")
-            return None
-        model = arch_model(returns, vol="Garch", p=1, q=1)
-        fitted = model.fit(disp="off")
-        return fitted
-    except Exception as e:
-        logging.error(f"Error training GARCH: {e}")
-        return None
-
-def forecast_garch(model, forecast_horizon, S0):
-    try:
-        if model is None:
-            return np.array([S0] * forecast_horizon)
-        forecast = model.forecast(horizon=forecast_horizon)
-        returns = forecast.mean.iloc[-1].values / 100
-        prices = [S0]
-        for ret in returns:
-            prices.append(prices[-1] * (1 + ret))
-        return np.array(prices[1:])
-    except Exception as e:
-        logging.error(f"Error forecasting GARCH: {e}")
-        return np.array([S0] * forecast_horizon)
-
-def gbm_paths(S0, mu, sigma, steps, n_paths=500):
-    try:
-        dt = 1 / 252  # Daily time step
-        paths = np.zeros((n_paths, steps))
-        paths[:, 0] = S0
-        for t in range(1, steps):
-            paths[:, t] = paths[:, t-1] * np.exp((mu - 0.5 * sigma**2) * dt + sigma * np.sqrt(dt) * np.random.normal(0, 1, n_paths))
-        return paths
-    except Exception as e:
-        logging.error(f"Error in GBM paths: {e}")
-        return np.zeros((n_paths, steps))
-
-def ou_paths(S0, theta, mu, sigma, steps, n_paths=300):
-    try:
-        dt = 1 / 252
-        paths = np.zeros((n_paths, steps))
-        paths[:, 0] = S0
-        for t in range(1, steps):
-            paths[:, t] = paths[:, t-1] + theta * (mu - paths[:, t-1]) * dt + sigma * np.sqrt(dt) * np.random.normal(0, 1, n_paths)
-        return paths
-    except Exception as e:
-        logging.error(f"Error in OU paths: {e}")
-        return np.zeros((n_paths, steps))
-
-def boltzmann_proxy(S0, sigma, steps, n_paths=500):
-    try:
-        dt = 1 / 252
-        paths = np.zeros((n_paths, steps))
-        paths[:, 0] = S0
-        for t in range(1, steps):
-            paths[:, t] = paths[:, t-1] * np.exp(np.random.normal(0, sigma * np.sqrt(dt), n_paths))
-        return paths
-    except Exception as e:
-        logging.error(f"Error in Boltzmann proxy: {e}")
-        return np.zeros((n_paths, steps))
-
-def schrodinger_proxy(S0, steps, n_paths=500):
-    try:
-        dt = 1 / 252
-        paths = np.zeros((n_paths, steps))
-        paths[:, 0] = S0
-        for t in range(1, steps):
-            paths[:, t] = paths[:, t-1] * np.exp(np.random.normal(0, 0.01 * np.sqrt(dt), n_paths))
-        return paths
-    except Exception as e:
-        logging.error(f"Error in Schrodinger proxy: {e}")
-        return np.zeros((n_paths, steps))
-
-def walk_forward_backtest(data, window, forecast_horizon):
-    try:
-        results = []
-        train_window = min(756, len(data) - forecast_horizon - 10)  # ~3 years
-        if len(data) < train_window + forecast_horizon + 10:
-            logging.warning(f"Insufficient data for backtest: {len(data)} rows")
-            return {"fold_rmse": [], "avg_rmse": None}
-        features = ["returns", "mean_price", "high", "low", "amount_change", "open", "close", "pct_change", "direction"]
-        data_features = data[features].dropna()
         scaler = StandardScaler()
-        scaled_data = scaler.fit_transform(data_features)
-        for i in range(0, len(data_features) - train_window - forecast_horizon, 63):  # Retrain every ~3 months
-            train_data = data_features.iloc[i:i + train_window]
-            test_data = data_features.iloc[i + train_window:i + train_window + forecast_horizon]["close"]
-            model, _, _ = train_lstm_model(train_data, window, forecast_horizon)
-            if model is None:
-                continue
-            last_window = scaled_data[i + train_window - window:i + train_window]
-            if len(last_window) != window:
-                continue
-            pred = forecast_lstm(model, scaler, last_window, window, forecast_horizon, test_data.iloc[0]["close"])
-            rmse = np.sqrt(np.mean((pred - test_data.values)**2))
-            results.append(rmse)
-        return {"fold_rmse": results, "avg_rmse": np.mean(results) if results else None}
+        features = ["close", "rsi", "sma_20", "macd", "atr", "volume"]
+        scaled_data = scaler.fit_transform(df[features])
+        X, y = [], []
+        for i in range(len(scaled_data) - window - forecast_horizon):
+            X.append(scaled_data[i:i + window])
+            y.append(scaled_data[i + window:i + window + forecast_horizon, 0])  # Predict 'close' only
+        if len(X) < 10:
+            logging.warning(f"Insufficient data for LSTM training: {len(X)} samples")
+            return np.array([df["close"].mean()] * forecast_horizon)
+        X, y = np.array(X), np.array(y)
+        logging.info(f"LSTM training data shapes - X: {X.shape}, y: {y.shape}")
+        model = Sequential([
+            LSTM(50, return_sequences=True, input_shape=(window, len(features)), kernel_regularizer=l2(0.01)),
+            Dropout(0.2),
+            LSTM(50, kernel_regularizer=l2(0.01)),
+            Dropout(0.2),
+            Dense(forecast_horizon)  # Output exactly forecast_horizon values
+        ])
+        model.compile(optimizer="adam", loss="mse")
+        model.fit(X, y, epochs=LSTM_EPOCHS, batch_size=LSTM_BATCH_SIZE, verbose=0,
+                  callbacks=[EarlyStopping(patience=5)])
+        last_sequence = scaled_data[-window:].reshape(1, window, len(features))
+        forecast_scaled = model.predict(last_sequence, verbose=0)  # Shape: (1, forecast_horizon)
+        forecast_scaled = forecast_scaled[0]  # Shape: (forecast_horizon,)
+        forecast_padded = np.zeros((forecast_horizon, len(features)))
+        forecast_padded[:, 0] = forecast_scaled  # Place forecast in 'close' column
+        forecast = scaler.inverse_transform(forecast_padded)[:, 0]  # Extract 'close' column
+        logging.info(f"LSTM forecast shape: {forecast.shape}")
+        return forecast
     except Exception as e:
-        logging.error(f"Error in walk-forward backtest: {e}")
-        return {"fold_rmse": [], "avg_rmse": None}
+        logging.error(f"LSTM error: {e}")
+        return np.array([df["close"].mean()] * forecast_horizon)
 
-def get_retail_institutional_metrics(symbol, start_date, end_date, timeframe="day"):
+def backtest_forecast(df, forecast, timeframe="day"):
     try:
-        if timeframe == "day":
-            bars = client.get_aggs(ticker=symbol, multiplier=1, timespan="day", from_=start_date, to=end_date, limit=5000)
-        else:
-            bars = client.get_aggs(ticker=symbol, multiplier=1, timespan="hour", from_=start_date, to=end_date, limit=5000)
-        df = pd.DataFrame([{
-            "date": datetime.fromtimestamp(bar.timestamp / 1000),
-            "volume": bar.volume,
-            "vwap": bar.vwap
-        } for bar in bars])
-        df["date"] = pd.to_datetime(df["date"]).dt.tz_localize("UTC").dt.tz_convert("US/Eastern")
-        if timeframe == "hour":
-            df = df[df["date"].dt.time.between(time(9, 30), time(16, 0))]
-        if df.empty:
-            logging.warning(f"No trade data for {symbol} ({timeframe}), falling back to yfinance")
-            yf_df = download_ohlcv_yfinance(symbol, start_date, end_date)
-            if yf_df is None or yf_df.empty:
-                return None
-            df = yf_df.rename(columns={"timestamp": "date", "volume": "volume"})
-            df["vwap"] = df["close"]  # Approximate VWAP
-        df["trade_size"] = df["volume"] * df["vwap"]
-        df["retail_volume"] = df["volume"].where(df["trade_size"] < RETAIL_THRESHOLD, 0)
-        df["inst_volume"] = df["volume"].where(df["trade_size"] >= INSTITUTIONAL_THRESHOLD, 0)
-        df["retail_pct"] = df["retail_volume"] / df["volume"].replace(0, np.nan)
-        df["inst_pct"] = df["inst_volume"] / df["volume"].replace(0, np.nan)
-        df["retail_buy_volume"] = df["retail_volume"] * 0.5
-        df["inst_buy_volume"] = df["inst_volume"] * 0.5
-        df["retail_sell_volume"] = df["retail_volume"] - df["retail_buy_volume"]
-        df["inst_sell_volume"] = df["inst_volume"] - df["inst_buy_volume"]
-        df["retail_buy_pct"] = df["retail_buy_volume"] / df["retail_volume"].replace(0, np.nan)
-        df["inst_buy_pct"] = df["inst_buy_volume"] / df["inst_volume"].replace(0, np.nan)
-        df["normal_growth_rate"] = df["retail_volume"].pct_change().rolling(window=20).mean().iloc[-1] if len(df) >= 20 else 0
-        df["current_growth_rate"] = df["retail_volume"].pct_change().iloc[-1] if len(df) >= 1 else 0
-        df["volume_growth_signal"] = 1 if df["current_growth_rate"] > df["normal_growth_rate"] else 0
-        return df.fillna(method="ffill").fillna(0)
+        historical = df["close"].iloc[-60:]  # Last 60 periods
+        if len(historical) < len(forecast):
+            logging.warning(f"Insufficient historical data for backtest: {len(historical)} < {len(forecast)}")
+            return {"rmse": 0.0, "crash_prob": 0.0}
+        rmse = np.sqrt(np.mean((historical[-len(forecast):] - forecast) ** 2))
+        returns = pd.Series(forecast).pct_change()
+        crash_prob = np.mean(returns < -0.05) if len(returns) > 1 else 0.0
+        return {"rmse": rmse, "crash_prob": crash_prob}
     except Exception as e:
-        logging.error(f"Error getting retail/inst metrics for {symbol} ({timeframe}): {e}")
-        return None
-
-def forecast_retail_institutional(df, forecast_horizon):
-    try:
-        retail_pct = df["retail_pct"].iloc[-1]
-        inst_pct = df["inst_pct"].iloc[-1]
-        retail_buy_pct = df["retail_buy_pct"].iloc[-1]
-        inst_buy_pct = df["inst_buy_pct"].iloc[-1]
-        retail_volume = df["retail_volume"].iloc[-1]
-        inst_volume = df["inst_volume"].iloc[-1]
-        retail_buy_volume = df["retail_buy_volume"].iloc[-1]
-        inst_buy_volume = df["inst_buy_volume"].iloc[-1]
-        retail_sell_volume = df["retail_sell_volume"].iloc[-1]
-        inst_sell_volume = df["inst_sell_volume"].iloc[-1]
-        return pd.DataFrame({
-            "day": range(1, forecast_horizon + 1),
-            "retail_pct": [retail_pct] * forecast_horizon,
-            "inst_pct": [inst_pct] * forecast_horizon,
-            "retail_buy_pct": [retail_buy_pct] * forecast_horizon,
-            "inst_buy_pct": [inst_buy_pct] * forecast_horizon,
-            "retail_volume": [retail_volume] * forecast_horizon,
-            "inst_volume": [inst_volume] * forecast_horizon,
-            "retail_buy_volume": [retail_buy_volume] * forecast_horizon,
-            "inst_buy_volume": [inst_buy_volume] * forecast_horizon,
-            "retail_sell_volume": [retail_sell_volume] * forecast_horizon,
-            "inst_sell_volume": [inst_sell_volume] * forecast_horizon
-        })
-    except Exception as e:
-        logging.error(f"Error forecasting retail/institutional: {e}")
-        return None
+        logging.error(f"Backtest error: {e}")
+        return {"rmse": 0.0, "crash_prob": 0.0}
 
 def compute_correlations(output_dir=DRIVE_SAVE_DIR, forecast_horizon=FORECAST_HORIZON_DAYS, timeframe="day"):
     try:
+        os.makedirs(output_dir, exist_ok=True)
         corr_data = []
-        metrics = ["math_mean", "lstm_mean", "meta_blended", "retail_volume", "inst_volume", "retail_buy_pct", "inst_buy_pct"]
+        metrics = ["arima_mean", "lstm_mean", "meta_blended", "retail_volume", "inst_volume", "retail_buy_pct", "inst_buy_pct"]
         for ticker_dir in os.listdir(output_dir):
             base_dir = os.path.join(output_dir, ticker_dir, timeframe)
             if not os.path.isdir(base_dir):
@@ -395,17 +422,18 @@ def compute_correlations(output_dir=DRIVE_SAVE_DIR, forecast_horizon=FORECAST_HO
                 df_forecast = pd.read_csv(forecast_file)
                 df_retail = pd.read_csv(retail_forecast_file)
                 if len(df_forecast) < forecast_horizon or len(df_retail) < forecast_horizon:
-                    logging.warning(f"Insufficient data for {ticker_dir} ({timeframe}): forecast={len(df_forecast)}, retail={len(df_retail)}")
                     continue
                 combined_df = pd.DataFrame({
-                    "math_mean": df_forecast["math_mean"],
+                    "arima_mean": df_forecast["arima_mean"],
                     "lstm_mean": df_forecast["lstm_mean"],
                     "meta_blended": df_forecast["meta_blended"],
                     "retail_volume": df_retail["retail_volume"],
                     "inst_volume": df_retail["inst_volume"],
                     "retail_buy_pct": df_retail["retail_buy_pct"],
                     "inst_buy_pct": df_retail["inst_buy_pct"]
-                })
+                }).dropna()
+                if len(combined_df) < 2:
+                    continue
                 corr_matrix = combined_df.corr(method="pearson")
                 corr_dict = {"ticker": ticker_dir}
                 for i, metric1 in enumerate(metrics):
@@ -420,147 +448,277 @@ def compute_correlations(output_dir=DRIVE_SAVE_DIR, forecast_horizon=FORECAST_HO
             ])
             corr_path = os.path.join(output_dir, f"correlation_analysis_{timeframe}.csv")
             safe_save(avg_corr_df, corr_path)
-            logging.info(f"Correlation analysis saved to {corr_path}")
+            logging.info(f"Correlations saved to {corr_path}")
             return avg_corr_df
-        else:
-            logging.warning(f"No correlation data for {timeframe}")
-            return None
+        logging.warning(f"No valid data for correlations ({timeframe})")
+        return None
     except Exception as e:
         logging.error(f"Error in compute_correlations: {e}")
         return None
 
-def process_ticker(symbol, start_date, end_date, forecast_horizon, window, timeframe="day"):
+def compute_portfolio_aggregates(output_dir=DRIVE_SAVE_DIR, forecast_horizon=FORECAST_HORIZON_DAYS, timeframe="day"):
     try:
-        logging.info(f"Processing {symbol} ({timeframe})")
-        df = download_bars_polygon(symbol, start_date, end_date, timeframe)
-        if df is None or len(df) < window:
-            logging.warning(f"Polygon failed for {symbol}, trying yfinance")
-            df = download_ohlcv_yfinance(symbol, start_date, end_date)
-            if df is None or len(df) < window:
-                logging.warning(f"Insufficient data for {symbol}: {len(df) if df is not None else 'None'}")
-                return {"symbol": symbol, "status": "failed", "error": "Insufficient data or API failure"}
-
-        df_ind = compute_indicators(df)
-        if df_ind is None:
-            return {"symbol": symbol, "status": "failed", "error": "Indicator computation failed"}
-
-        S0 = df_ind["close"].iloc[-1]
-        lstm_model, scaler, scaled_data = train_lstm_model(df_ind, window, forecast_horizon)
-        if lstm_model is None:
-            lstm_pred = np.array([S0] * forecast_horizon)
-        else:
-            lstm_pred = forecast_lstm(lstm_model, scaler, scaled_data, window, forecast_horizon, S0)
-
-        hmm_model = train_hmm(df_ind)
-        hmm_pred = forecast_hmm(hmm_model, df_ind, forecast_horizon, S0)
-        garch_model = train_garch(df_ind)
-        garch_pred = forecast_garch(garch_model, forecast_horizon, S0)
-
-        mu = df_ind["returns"].mean()
-        sigma = df_ind["returns"].std()
-        gbm_m = np.mean(gbm_paths(S0, mu, sigma, steps=forecast_horizon), axis=0)
-        ou_m = np.mean(ou_paths(S0, theta=0.1, mu=df_ind["close"].mean(), sigma=sigma, steps=forecast_horizon), axis=0)
-        boltz_m = np.mean(boltzmann_proxy(S0, sigma * S0, steps=forecast_horizon), axis=0)
-        schr_m = np.mean(schrodinger_proxy(S0, steps=forecast_horizon), axis=0)
-        math_mean = np.mean([gbm_m, ou_m, boltz_m, schr_m], axis=0)
-        crash_prob = np.mean((hmm_pred / S0 - 1) < -0.05)
-
-        retail_start = (datetime.now() - timedelta(days=TRADE_SAMPLE_DAYS if timeframe == "day" else TRADE_SAMPLE_HOURS)).strftime("%Y-%m-%d")
-        retail_inst_df = get_retail_institutional_metrics(symbol, retail_start, end_date, timeframe)
-        if retail_inst_df is None:
-            return {"symbol": symbol, "status": "failed", "error": "Retail/institutional metrics failed"}
-
-        retail_inst_forecast = forecast_retail_institutional(retail_inst_df, forecast_horizon)
-        if retail_inst_forecast is None:
-            return {"symbol": symbol, "status": "failed", "error": "Retail/institutional forecast failed"}
-
-        wb = walk_forward_backtest(df_ind, window, forecast_horizon)
-        meta = {
-            "symbol": symbol,
-            "timestamp": END_DATE,
-            "retail_pct": retail_inst_df["retail_pct"].iloc[-1],
-            "inst_pct": retail_inst_df["inst_pct"].iloc[-1],
-            "retail_buy_pct": retail_inst_df["retail_buy_pct"].iloc[-1],
-            "inst_buy_pct": retail_inst_df["inst_buy_pct"].iloc[-1],
-            "backtest": wb
+        os.makedirs(output_dir, exist_ok=True)
+        agg_data = {
+            "day": list(range(1, forecast_horizon + 1)),
+            "avg_arima_mean": [],
+            "avg_lstm_mean": [],
+            "avg_meta_blended": [],
+            "wtd_avg_arima_mean": [],
+            "wtd_avg_lstm_mean": [],
+            "wtd_avg_meta_blended": [],
+            "total_retail_volume": [],
+            "total_inst_volume": [],
+            "avg_retail_buy_pct": [],
+            "avg_inst_buy_pct": [],
+            "wtd_avg_retail_buy_pct": [],
+            "wtd_avg_inst_buy_pct": [],
+            "avg_crash_prob": []
         }
+        ticker_data = []
+        total_market_cap = 0
+        for ticker_dir in os.listdir(output_dir):
+            base_dir = os.path.join(output_dir, ticker_dir, timeframe)
+            if not os.path.isdir(base_dir):
+                continue
+            forecast_file = os.path.join(base_dir, f"forecast_{'5d_hourly' if timeframe == 'hour' else '30d'}.csv")
+            retail_forecast_file = os.path.join(base_dir, "retail_inst_forecast.csv")
+            meta_file = os.path.join(base_dir, "meta.json")
+            if os.path.exists(forecast_file) and os.path.exists(retail_forecast_file) and os.path.exists(meta_file):
+                df_forecast = pd.read_csv(forecast_file)
+                df_retail = pd.read_csv(retail_forecast_file)
+                with open(meta_file, "r") as f:
+                    meta = json.load(f)
+                if len(df_forecast) < forecast_horizon or len(df_retail) < forecast_horizon:
+                    logging.warning(f"Insufficient data for {ticker_dir} in portfolio aggregates")
+                    continue
+                market_cap = get_market_cap(ticker_dir)
+                ticker_data.append({
+                    "ticker": ticker_dir,
+                    "market_cap": market_cap,
+                    "arima_mean": df_forecast["arima_mean"].values,
+                    "lstm_mean": df_forecast["lstm_mean"].values,
+                    "meta_blended": df_forecast["meta_blended"].values,
+                    "retail_volume": df_retail["retail_volume"].values,
+                    "inst_volume": df_retail["inst_volume"].values,
+                    "retail_buy_pct": df_retail["retail_buy_pct"].values,
+                    "inst_buy_pct": df_retail["inst_buy_pct"].values,
+                    "crash_prob": [meta["backtest"]["crash_prob"]] * forecast_horizon
+                })
+                total_market_cap += market_cap
+        if not ticker_data:
+            logging.warning(f"No valid data for portfolio aggregates ({timeframe})")
+            return None
+        for key in ["arima_mean", "lstm_mean", "meta_blended", "retail_buy_pct", "inst_buy_pct", "crash_prob"]:
+            values = [d[key] for d in ticker_data]
+            if values:
+                agg_data[f"avg_{key}"] = np.mean(values, axis=0)
+                if key in ["arima_mean", "lstm_mean", "meta_blended", "retail_buy_pct", "inst_buy_pct"]:
+                    weights = [d["market_cap"] / total_market_cap for d in ticker_data]
+                    agg_data[f"wtd_avg_{key}"] = np.average(values, axis=0, weights=weights)
+            else:
+                agg_data[f"avg_{key}"] = [0] * forecast_horizon
+                if key in ["arima_mean", "lstm_mean", "meta_blended", "retail_buy_pct", "inst_buy_pct"]:
+                    agg_data[f"wtd_avg_{key}"] = [0] * forecast_horizon
+        for key in ["retail_volume", "inst_volume"]:
+            values = [d[key] for d in ticker_data]
+            agg_data[f"total_{key}"] = np.sum(values, axis=0) if values else [0] * forecast_horizon
+        agg_df = pd.DataFrame(agg_data)
+        agg_path = os.path.join(output_dir, f"portfolio_aggregates_{timeframe}.csv")
+        safe_save(agg_df, agg_path)
+        logging.info(f"Portfolio aggregates saved to {agg_path}")
+        return agg_df
+    except Exception as e:
+        logging.error(f"Error in compute_portfolio_aggregates: {e}")
+        return None
 
+def run_ticker(ticker, start_date, end_date, forecast_horizon, window, timeframe="day"):
+    try:
+        logging.info(f"Processing {ticker} ({timeframe})...")
+        df = download_bars_polygon(ticker, start_date, end_date, timeframe)
+        if df is None:
+            logging.warning(f"Data download failed for {ticker}")
+            forecast_df = pd.DataFrame({
+                "day": range(1, forecast_horizon + 1),
+                "arima_mean": [0.0] * forecast_horizon,
+                "lstm_mean": [0.0] * forecast_horizon,
+                "meta_blended": [0.0] * forecast_horizon
+            })
+            retail_inst_df = pd.DataFrame({
+                "day": range(1, forecast_horizon + 1),
+                "retail_volume": [0.0] * forecast_horizon,
+                "inst_volume": [0.0] * forecast_horizon,
+                "retail_buy_pct": [50.0] * forecast_horizon,
+                "inst_buy_pct": [50.0] * forecast_horizon
+            })
+            technicals_df = pd.DataFrame({
+                "day": range(1, forecast_horizon + 1),
+                "pred_rsi": [50.0] * forecast_horizon,
+                "pred_sma_20": [0.0] * forecast_horizon,
+                "pred_macd": [0.0] * forecast_horizon,
+                "pred_atr": [0.0] * forecast_horizon
+            })
+            base_dir = os.path.join(DRIVE_SAVE_DIR, ticker, timeframe)
+            forecast_path = os.path.join(base_dir, f"forecast_{'5d_hourly' if timeframe == 'hour' else '30d'}.csv")
+            retail_inst_path = os.path.join(base_dir, "retail_inst_forecast.csv")
+            technicals_path = os.path.join(base_dir, "predicted_technicals.csv")
+            meta_path = os.path.join(base_dir, "meta.json")
+            safe_save(forecast_df, forecast_path)
+            safe_save(retail_inst_df, retail_inst_path)
+            safe_save(technicals_df, technicals_path)
+            meta = {"backtest": {"crash_prob": 0.0, "rmse": 0.0}}
+            with open(meta_path, "w") as f:
+                json.dump(meta, f)
+            upload_to_spaces(meta_path, f"{ticker}/{timeframe}/meta.json")
+            return {"ticker": ticker, "status": "failed", "error": "Data download failed"}
+        
+        df_indicators = compute_indicators(df, timeframe)
+        if df_indicators is None:
+            logging.warning(f"Indicator computation failed for {ticker}")
+            forecast_df = pd.DataFrame({
+                "day": range(1, forecast_horizon + 1),
+                "arima_mean": [df["close"].mean()] * forecast_horizon,
+                "lstm_mean": [df["close"].mean()] * forecast_horizon,
+                "meta_blended": [df["close"].mean()] * forecast_horizon
+            })
+            retail_inst_df = pd.DataFrame({
+                "day": range(1, forecast_horizon + 1),
+                "retail_volume": [0.0] * forecast_horizon,
+                "inst_volume": [0.0] * forecast_horizon,
+                "retail_buy_pct": [50.0] * forecast_horizon,
+                "inst_buy_pct": [50.0] * forecast_horizon
+            })
+            technicals_df = pd.DataFrame({
+                "day": range(1, forecast_horizon + 1),
+                "pred_rsi": [50.0] * forecast_horizon,
+                "pred_sma_20": [df["close"].mean()] * forecast_horizon,
+                "pred_macd": [0.0] * forecast_horizon,
+                "pred_atr": [0.0] * forecast_horizon
+            })
+            base_dir = os.path.join(DRIVE_SAVE_DIR, ticker, timeframe)
+            forecast_path = os.path.join(base_dir, f"forecast_{'5d_hourly' if timeframe == 'hour' else '30d'}.csv")
+            retail_inst_path = os.path.join(base_dir, "retail_inst_forecast.csv")
+            technicals_path = os.path.join(base_dir, "predicted_technicals.csv")
+            meta_path = os.path.join(base_dir, "meta.json")
+            safe_save(forecast_df, forecast_path)
+            safe_save(retail_inst_df, retail_inst_path)
+            safe_save(technicals_df, technicals_path)
+            meta = {"backtest": {"crash_prob": 0.0, "rmse": 0.0}}
+            with open(meta_path, "w") as f:
+                json.dump(meta, f)
+            upload_to_spaces(meta_path, f"{ticker}/{timeframe}/meta.json")
+            return {"ticker": ticker, "status": "failed", "error": "Indicator computation failed"}
+        
+        pred_technicals = compute_predicted_technicals(df_indicators, forecast_horizon, window, timeframe)
+        arima_forecast = compute_arima_forecast(df_indicators, forecast_horizon, timeframe)
+        lstm_forecast = compute_lstm_forecast(df_indicators, pred_technicals, forecast_horizon, window, timeframe)
+        
+        trade_start_date = (datetime.now() - timedelta(days=TRADE_SAMPLE_DAYS)).strftime("%Y-%m-%d")
+        df_trades = download_trades_polygon(ticker, trade_start_date, end_date)
+        if df_trades is None:
+            logging.warning(f"Trade data download failed for {ticker}")
+            retail_volume = inst_volume = 0
+            retail_buy_pct = inst_buy_pct = 50.0
+        else:
+            df_quotes = download_quotes_polygon(ticker, trade_start_date, end_date)
+            df_trades = classify_trades(df_trades, df_quotes, df)
+            if df_trades is None:
+                logging.warning(f"Trade classification failed for {ticker}")
+                retail_volume = inst_volume = 0
+                retail_buy_pct = inst_buy_pct = 50.0
+            else:
+                retail_trades = df_trades[df_trades["is_retail"]]
+                inst_trades = df_trades[df_trades["is_institutional"]]
+                retail_volume = retail_trades["size"].sum() if not retail_trades.empty else 0
+                inst_volume = inst_trades["size"].sum() if not inst_trades.empty else 0
+                retail_buy_pct = (retail_trades["is_buy"].mean() * 100) if not retail_trades.empty else 50.0
+                inst_buy_pct = (inst_trades["is_buy"].mean() * 100) if not inst_trades.empty else 50.0
+                logging.info(f"{ticker} retail_buy_pct: {retail_buy_pct:.2f}, inst_buy_pct: {inst_buy_pct:.2f}")
+        
         forecast_df = pd.DataFrame({
-            "day" if timeframe == "day" else "hour": range(1, forecast_horizon + 1),
-            "math_mean": math_mean,
-            "lstm_mean": lstm_pred,
-            "meta_blended": META_WEIGHTS["math"] * math_mean + META_WEIGHTS["lstm"] * lstm_pred + META_WEIGHTS["volume"] * retail_inst_df["volume"].iloc[-1] / retail_inst_df["volume"].mean(),
-            "crash_prob": [crash_prob] * forecast_horizon
+            "day": range(1, forecast_horizon + 1),
+            "arima_mean": arima_forecast,
+            "lstm_mean": lstm_forecast,
+            "meta_blended": META_WEIGHTS["arima"] * arima_forecast +
+                           META_WEIGHTS["lstm"] * lstm_forecast +
+                           META_WEIGHTS["volume"] * df_indicators["volume"].mean()
         })
-
-        output_dir = os.path.join(DRIVE_SAVE_DIR, symbol, "hourly" if timeframe == "hour" else "daily")
-        safe_save(forecast_df, os.path.join(output_dir, f"forecast_{'5d_hourly' if timeframe == 'hour' else '30d'}.csv"))
-        safe_save(df_ind, os.path.join(output_dir, "indicators.csv"))
-        safe_save(retail_inst_df, os.path.join(output_dir, "retail_inst_metrics.csv"))
-        safe_save(retail_inst_forecast, os.path.join(output_dir, "retail_inst_forecast.csv"))
-        meta_path = os.path.join(output_dir, "meta.json")
+        retail_inst_df = pd.DataFrame({
+            "day": range(1, forecast_horizon + 1),
+            "retail_volume": [retail_volume] * forecast_horizon,
+            "inst_volume": [inst_volume] * forecast_horizon,
+            "retail_buy_pct": [retail_buy_pct] * forecast_horizon,
+            "inst_buy_pct": [inst_buy_pct] * forecast_horizon
+        })
+        technicals_df = pred_technicals
+        backtest_results = backtest_forecast(df_indicators, lstm_forecast, timeframe)
+        
+        base_dir = os.path.join(DRIVE_SAVE_DIR, ticker, timeframe)
+        forecast_path = os.path.join(base_dir, f"forecast_{'5d_hourly' if timeframe == 'hour' else '30d'}.csv")
+        indicators_path = os.path.join(base_dir, "indicators.csv")
+        retail_inst_path = os.path.join(base_dir, "retail_inst_forecast.csv")
+        technicals_path = os.path.join(base_dir, "predicted_technicals.csv")
+        meta_path = os.path.join(base_dir, "meta.json")
+        
+        safe_save(forecast_df, forecast_path)
+        safe_save(df_indicators.reset_index(), indicators_path)
+        safe_save(retail_inst_df, retail_inst_path)
+        safe_save(technicals_df, technicals_path)
+        
+        meta = {"backtest": backtest_results}
         with open(meta_path, "w") as f:
             json.dump(meta, f)
-        upload_to_spaces(meta_path, f"{symbol}/{timeframe}/meta.json")
-
-        logging.info(f"Successfully processed {symbol} ({timeframe})")
-        return {"symbol": symbol, "status": "success", "rmse": wb["avg_rmse"]}
+        upload_to_spaces(meta_path, f"{ticker}/{timeframe}/meta.json")
+        
+        return {"ticker": ticker, "status": "success", "error": ""}
     except Exception as e:
-        logging.error(f"Error processing {symbol} ({timeframe}): {e}")
-        return {"symbol": symbol, "status": "failed", "error": str(e)}
+        logging.error(f"Error processing {ticker}: {e}")
+        return {"ticker": ticker, "status": "failed", "error": str(e)}
 
 def run_batch(tickers, start_date, end_date, forecast_horizon, window, timeframe="day"):
     try:
-        results = []
-        with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
-            futures = [executor.submit(process_ticker, ticker, start_date, end_date, forecast_horizon, window, timeframe) for ticker in tickers]
-            for future in futures:
-                result = future.result()
-                if result is not None:
-                    results.append(result)
-                else:
-                    logging.warning(f"Received None result for a ticker in {timeframe} batch")
-        summary = pd.DataFrame(results)
-        summary_path = os.path.join(DRIVE_SAVE_DIR, f"batch_summary_{timeframe}.csv")
-        safe_save(summary, summary_path)
-        logging.info(f"Batch summary saved for {timeframe}")
-        return results
+        if IS_COLAB:
+            return [run_ticker(ticker, start_date, end_date, forecast_horizon, window, timeframe) for ticker in tickers]
+        else:
+            with ProcessPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                return list(executor.map(run_ticker, tickers,
+                                        [start_date] * len(tickers),
+                                        [end_date] * len(tickers),
+                                        [forecast_horizon] * len(tickers),
+                                        [window] * len(tickers),
+                                        [timeframe] * len(tickers)))
     except Exception as e:
-        logging.error(f"Error in run_batch ({timeframe}): {e}")
-        return []
+        logging.error(f"Error in run_batch: {e}")
+        return [{"ticker": ticker, "status": "failed", "error": str(e)} for ticker in tickers]
 
-def get_sp500_tickers():
-    try:
-        tables = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")
-        df = tables[0]
-        return df["Symbol"].tolist()[:500]
-    except Exception as e:
-        logging.error(f"Error fetching S&P 500 tickers: {e}")
-        return []
-
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description="Quantavious stock forecasting")
-    parser.add_argument("--tickers", type=str, help="Comma-separated list of tickers (e.g., AAPL,MSFT)")
-    args = parser.parse_args()
+    parser.add_argument("--tickers", type=str, default="AAPL", help="Comma-separated list of tickers (e.g., AAPL)")
+    args, _ = parser.parse_known_args(argv)
 
-    if args.tickers:
-        TICKERS = args.tickers.split(",")
-    else:
-        TICKERS = get_sp500_tickers()
+    log_schedule()
+    os.makedirs(DRIVE_SAVE_DIR, exist_ok=True)
+    if datetime.now().weekday() >= 5 and not IS_COLAB:
+        logging.info("Exiting: No run on weekends")
+        return
+
+    TICKERS = args.tickers.split(",")
     if not TICKERS:
-        logging.error("No tickers fetched. Exiting.")
-        exit(1)
+        logging.error("No tickers provided. Exiting.")
+        sys.exit(1)
 
     start_date_daily = (datetime.now() - timedelta(days=TRAIN_YEARS * 365)).strftime("%Y-%m-%d")
-    start_date_hourly = (datetime.now() - timedelta(days=60)).strftime("%Y-%m-%d")
+    start_date_hourly = (datetime.now() - timedelta(days=HOURLY_FETCH_DAYS)).strftime("%Y-%m-%d")
 
     logging.info("Starting daily batch...")
-    daily_results = run_batch(TICKERS, start_date_daily, END_DATE, FORECAST_HORIZON_DAYS, LSTM_WINDOW_DAILY, timeframe="day")
+    daily_results = run_batch(TICKERS, start_date_daily, END_DATE, FORECAST_HORIZON_DAYS, LSTM_WINDOW_DAILY, "day")
     compute_correlations(forecast_horizon=FORECAST_HORIZON_DAYS, timeframe="day")
+    compute_portfolio_aggregates(forecast_horizon=FORECAST_HORIZON_DAYS, timeframe="day")
 
     logging.info("Starting hourly batch...")
-    hourly_results = run_batch(TICKERS, start_date_hourly, END_DATE, FORECAST_HORIZON_HOURS, LSTM_WINDOW_HOURLY, timeframe="hour")
+    hourly_results = run_batch(TICKERS, start_date_hourly, END_DATE, FORECAST_HORIZON_HOURS, LSTM_WINDOW_HOURLY, "hour")
     compute_correlations(forecast_horizon=FORECAST_HORIZON_HOURS, timeframe="hour")
+    compute_portfolio_aggregates(forecast_horizon=FORECAST_HORIZON_HOURS, timeframe="hour")
 
     summary = {"daily": daily_results, "hourly": hourly_results}
     summary_path = os.path.join(DRIVE_SAVE_DIR, "run_summary.json")
@@ -576,4 +734,4 @@ if __name__ == "__main__":
     warnings.filterwarnings("ignore")
     tf.config.threading.set_inter_op_parallelism_threads(MAX_WORKERS)
     tf.config.threading.set_intra_op_parallelism_threads(MAX_WORKERS)
-    main()
+    main(sys.argv)
